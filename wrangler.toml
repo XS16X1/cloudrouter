@@ -4,4 +4,4 @@ compatibility_date = "2023-09-01"
 
 [[kv_namespaces]]
 binding = "ROUTER_KV"
-id = "fcf3445ef9f349a0996c8d6400d2d771" # 这是部署日志中创建的KV命名空间ID
+id = "7c96a27354724439a1821beca8ea9c01" # 这是部署日志中创建的KV命名空间ID
