@@ -39,9 +39,9 @@ export async function getAdminHtml(env) {
             <div id="setupError" class="error-message hidden"></div>
             <form id="setupForm">
                 <label for="setupPassword">新密码:</label>
-                <input type="password" id="setupPassword" required>
+                <input type="password" id="setupPassword" autocomplete="new-password" required>
                 <label for="confirmPassword">确认密码:</label>
-                <input type="password" id="confirmPassword" required>
+                <input type="password" id="confirmPassword" autocomplete="new-password" required>
                 <button type="submit">设置密码</button>
             </form>
         </div>
@@ -50,7 +50,7 @@ export async function getAdminHtml(env) {
             <div id="loginError" class="error-message hidden"></div>
             <form id="loginForm">
                 <label for="loginPassword">密码:</label>
-                <input type="password" id="loginPassword" required>
+                <input type="password" id="loginPassword" autocomplete="current-password" required>
                 <button type="submit">登录</button>
             </form>
         </div>
@@ -68,7 +68,7 @@ export async function getAdminHtml(env) {
                 <label for="keyName">密钥名称:</label>
                 <input type="text" id="keyName" placeholder="例如：My Key 1" required>
                 <label for="keyValue">密钥值 (sk-...):</label>
-                <input type="password" id="keyValue" required>
+                <input type="password" id="keyValue" autocomplete="current-password" required>
                 <button type="submit">添加密钥</button>
             </form>
             
@@ -109,7 +109,7 @@ export async function getAdminHtml(env) {
                     </tr>
                 </thead>
                 <tbody id="keysList">
-                    <tr><td colspan="3">正在加载...</td></tr>
+                    <tr><td colspan="4">正在加载...</td></tr>
                 </tbody>
             </table>
              <button id="refreshKeysButton">重新加载</button>
@@ -152,11 +152,11 @@ export async function getAdminHtml(env) {
             <div id="changePasswordSuccess" class="success-message hidden"></div>
             <form id="changePasswordForm">
                 <label for="currentPassword">当前密码:</label>
-                <input type="password" id="currentPassword" required>
+                <input type="password" id="currentPassword" autocomplete="current-password" required>
                 <label for="newPassword">新密码:</label>
-                <input type="password" id="newPassword" required>
+                <input type="password" id="newPassword" autocomplete="new-password" required>
                 <label for="confirmNewPassword">确认新密码:</label>
-                <input type="password" id="confirmNewPassword" required>
+                <input type="password" id="confirmNewPassword" autocomplete="new-password" required>
                 <button type="submit">修改密码</button>
             </form>
         </div>
@@ -572,7 +572,7 @@ export async function getAdminHtml(env) {
         checkHealthButton.addEventListener('click', async () => {
             checkHealthButton.disabled = true;
             checkHealthButton.textContent = '检查中...';
-            keysList.innerHTML = '<tr><td colspan="3">正在进行深度健康检查，请稍候...</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="4">正在进行深度健康检查，请稍候...</td></tr>';
 
             try {
                 const result = await apiCall('/keys/refresh', 'POST');
