@@ -9,7 +9,6 @@ let currentKeyIndex = 0;
 let lastHealthCheck = 0;
 let adminPasswordHash = null; // 缓存管理员密码哈希
 let clientTokens = []; // 缓存客户端访问 token
-let dailyRequestStats = {}; // 每日请求统计，键为密钥值，值为请求次数
 
 // OpenRouter API 基础 URL
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -17,7 +16,6 @@ const KV_KEYS = {
   API_KEYS: 'api_keys',
   ADMIN_PASSWORD_HASH: 'admin_password_hash',
   CLIENT_TOKENS: 'client_tokens',
-  DAILY_REQUEST_STATS: 'daily_request_stats',
 };
 
 // --- 辅助函数 ---
@@ -25,11 +23,10 @@ const KV_KEYS = {
 // 初始化：从 KV 加载 API 密钥、管理员密码哈希和客户端 token
 async function initializeState(env) {
   try {
-    const [keysData, passwordHashData, tokensData, statsData] = await Promise.all([
+    const [keysData, passwordHashData, tokensData] = await Promise.all([
       env.ROUTER_KV.get(KV_KEYS.API_KEYS, { type: 'json' }),
       env.ROUTER_KV.get(KV_KEYS.ADMIN_PASSWORD_HASH, { type: 'text' }),
       env.ROUTER_KV.get(KV_KEYS.CLIENT_TOKENS, { type: 'json' }),
-      getDailyRequestStats(env),
     ]);
 
     if (keysData) {
@@ -69,15 +66,11 @@ async function initializeState(env) {
       clientTokens = [];
       console.log('未找到客户端 token');
     }
-
-    dailyRequestStats = statsData;
-    console.log(`已加载今日请求统计，共 ${Object.keys(dailyRequestStats).length} 个密钥有请求记录`);
   } catch (error) {
     console.error('初始化状态失败:', error);
-    apiKeys = {};
+    apiKeys = [];
     adminPasswordHash = null;
     clientTokens = [];
-    dailyRequestStats = {};
   }
 }
 
@@ -116,48 +109,6 @@ function generateToken() {
     result += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return result;
-}
-
-// 获取今日日期字符串 (YYYY-MM-DD)
-function getTodayDateString() {
-  const today = new Date();
-  const year = today.getFullYear();
-  const month = String(today.getMonth() + 1).padStart(2, '0');
-  const day = String(today.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
-
-// 异步获取每日请求统计
-async function getDailyRequestStats(env) {
-  try {
-    const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
-    const stats = await env.ROUTER_KV.get(todayKey, { type: 'json' });
-    return stats || {};
-  } catch (error) {
-    console.error('获取每日请求统计失败:', error);
-    return {};
-  }
-}
-
-// 异步更新每日请求统计
-async function incrementRequestCount(env, keyValue) {
-  // 立即更新内存缓存，确保实时性
-  dailyRequestStats[keyValue] = (dailyRequestStats[keyValue] || 0) + 1;
-
-  // 异步保存到KV，不阻塞主流程
-  try {
-    const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
-    await env.ROUTER_KV.put(todayKey, JSON.stringify(dailyRequestStats));
-  } catch (error) {
-    console.error('保存请求计数到KV失败:', error);
-    // 如果保存失败，尝试重新加载以保持数据一致性
-    try {
-      const freshStats = await getDailyRequestStats(env);
-      dailyRequestStats = freshStats;
-    } catch (reloadError) {
-      console.error('重新加载请求统计失败:', reloadError);
-    }
-  }
 }
 
 // 管理员认证中间件
@@ -236,15 +187,15 @@ async function checkKeyHealth(key) {
 }
 
 // 获取下一个可用的 API 密钥
-async function getNextApiKey(env) {
+async function getNextApiKey() {
   const keyValues = Object.keys(apiKeys);
   if (keyValues.length === 0) {
     throw new Error('没有可用的 API 密钥');
   }
 
-  // 每5分钟检查一次健康状态
+  // 每6小时检查一次健康状态
   const now = Date.now();
-  if (now - lastHealthCheck > 5 * 60 * 1000) {
+  if (now - lastHealthCheck > 6 * 60 * 60 * 1000) {
     console.log('执行 API 密钥健康检查...');
     for (const value of keyValues) {
       apiKeys[value].isHealthy = await checkKeyHealth(value);
@@ -343,7 +294,6 @@ async function getAdminHtml(env) {
                         <th><input type="checkbox" id="selectAllKeys"></th>
                         <th>状态</th>
                         <th>密钥</th>
-                        <th>今日请求</th>
                         <th>操作</th>
                     </tr>
                 </thead>
@@ -627,21 +577,21 @@ async function getAdminHtml(env) {
         });
         
         async function loadApiKeys() {
-            keysList.innerHTML = '<tr><td colspan="5">正在加载密钥...</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="3">正在加载密钥...</td></tr>';
             const result = await apiCall('/keys');
             if (result && result.keys) {
-                renderApiKeys(result.keys, result.dailyRequestStats || {});
+                renderApiKeys(result.keys);
             } else if (result === null) {
-                 keysList.innerHTML = '<tr><td colspan="5" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
+                 keysList.innerHTML = '<tr><td colspan="3" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
             } else {
-                 keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。</td></tr>';
+                 keysList.innerHTML = '<tr><td colspan="3">没有找到 API 密钥。</td></tr>';
             }
         }
         
-        function renderApiKeys(keys, dailyRequestStats) {
+        function renderApiKeys(keys) {
             const keyValues = Object.keys(keys);
             if (keyValues.length === 0) {
-                keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。请添加。</td></tr>';
+                keysList.innerHTML = '<tr><td colspan="3">没有找到 API 密钥。请添加。</td></tr>';
                 return;
             }
             keysList.innerHTML = keyValues.map(value => {
@@ -656,12 +606,10 @@ async function getAdminHtml(env) {
 
                 const maskedValue = value.substring(0, 8) + '...' + value.substring(value.length - 8);
                 const escapedValue = escapeHtml(value);
-                const requestCount = dailyRequestStats[value] || 0;
                 return '<tr>' +
                     '<td><input type="checkbox" class="keyCheckbox" value="' + escapedValue + '"></td>' +
                     '<td><span class="status ' + statusClass + '"></span> ' + statusText + '</td>' +
                     '<td><code style="font-size: 12px;">' + maskedValue + '</code></td>' +
-                    '<td>' + requestCount + '</td>' +
                     '<td><button class="danger" onclick="deleteApiKey(\\'' + escapedValue + '\\')">删除</button></td>' +
                     '</tr>';
             }).join('');
@@ -743,13 +691,13 @@ async function getAdminHtml(env) {
         checkHealthButton.addEventListener('click', async () => {
             checkHealthButton.disabled = true;
             checkHealthButton.textContent = '检查中...';
-            keysList.innerHTML = '<tr><td colspan="5">正在进行深度健康检查，请稍候...</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="3">正在进行深度健康检查，请稍候...</td></tr>';
 
             try {
                 const result = await apiCall('/keys/refresh', 'POST');
                 if (result && result.success) {
                     showApiKeySuccess(result.message);
-                    renderApiKeys(result.keys, result.dailyRequestStats || {});
+                    renderApiKeys(result.keys);
                 } else {
                     showApiKeyError('健康检查失败');
                     loadApiKeys(); // 回退到普通加载
@@ -1005,11 +953,7 @@ router.post('/api/admin/auth/change-password', requireAdminAuth, async (request,
 // --- API 密钥管理 ---
 router.get('/api/admin/keys', requireAdminAuth, async (request, env) => {
   await initializeState(env);
-  return new Response(JSON.stringify({
-    success: true,
-    keys: apiKeys,
-    dailyRequestStats: dailyRequestStats
-  }), {
+  return new Response(JSON.stringify({ success: true, keys: apiKeys }), {
     headers: { 'Content-Type': 'application/json' }
   });
 });
@@ -1088,17 +1032,6 @@ router.delete('/api/admin/keys/:value', requireAdminAuth, async (request, env) =
     }
 
     delete apiKeys[value];
-    // 同时从统计数据中移除
-    if (value in dailyRequestStats) {
-      delete dailyRequestStats[value];
-      // 异步更新KV中的统计数据
-      try {
-        const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
-        await env.ROUTER_KV.put(todayKey, JSON.stringify(dailyRequestStats));
-      } catch (error) {
-        console.error('更新统计数据失败:', error);
-      }
-    }
     await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
     return new Response(JSON.stringify({ success: true, message: 'API 密钥删除成功' }), {
@@ -1124,23 +1057,12 @@ router.post('/api/admin/keys/batch-delete', requireAdminAuth, async (request, en
     for (const key of keys) {
       if (key in apiKeys) {
         delete apiKeys[key];
-        // 从统计数据中移除
-        if (key in dailyRequestStats) {
-          delete dailyRequestStats[key];
-        }
         deletedCount++;
       }
     }
 
     if (deletedCount > 0) {
       await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
-      // 更新统计数据到KV
-      try {
-        const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
-        await env.ROUTER_KV.put(todayKey, JSON.stringify(dailyRequestStats));
-      } catch (error) {
-        console.error('更新统计数据失败:', error);
-      }
     }
 
     return new Response(JSON.stringify({
@@ -1280,7 +1202,7 @@ router.get('/v1/models', async (request, env) => {
   }
 
   try {
-    const apiKey = await getNextApiKey(env);
+    const apiKey = await getNextApiKey();
     const response = await fetch(`${OPENROUTER_BASE_URL}/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -1320,11 +1242,11 @@ router.post('/v1/chat/completions', async (request, env) => {
   }
 
   try {
-    const apiKey = await getNextApiKey(env);
+    const apiKey = await getNextApiKey();
     const requestBody = await request.json();
 
-    // 检查是否启用流式响应
-    const isStreaming = requestBody.stream === true;
+    // 检查是否为流式请求
+    const isStream = requestBody.stream === true;
 
     const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
       method: 'POST',
@@ -1337,23 +1259,45 @@ router.post('/v1/chat/completions', async (request, env) => {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('OpenRouter API 错误:', response.status, errorText);
-      return new Response(JSON.stringify({ error: { message: '上游API错误', type: 'api_error' } }),
+      console.error('OpenRouter API error:', response.status, errorText);
+      return new Response(JSON.stringify({ error: { message: 'OpenRouter API 请求失败', type: 'api_error' } }),
         { status: response.status, headers: { 'Content-Type': 'application/json' } });
     }
 
-    if (isStreaming) {
-      // 流式响应：直接转发上游的流式响应
-      return new Response(response.body, {
+    if (isStream) {
+      // 处理流式响应
+      const { readable, writable } = new TransformStream();
+
+      // 异步处理流式数据
+      (async () => {
+        const reader = response.body.getReader();
+        const writer = writable.getWriter();
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            await writer.write(value);
+          }
+        } catch (error) {
+          console.error('流式传输错误:', error);
+        } finally {
+          await writer.close();
+        }
+      })();
+
+      return new Response(readable, {
         status: response.status,
         headers: {
           'Content-Type': 'text/plain; charset=utf-8',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
-        }
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Cache-Control',
+        },
       });
     } else {
-      // 非流式响应：等待完整响应后返回
+      // 非流式响应
       const responseData = await response.text();
       return new Response(responseData, {
         status: response.status,
