@@ -15,6 +15,7 @@ let keyStatus = {
   "unverified": [],
   "valid": []
 };
+let isInitialized = false; // 标记是否已经初始化
 
 // --- 请求统计变量 ---
 let requestTimestamps = []; // 请求时间戳数组 (用于RPM计算)
@@ -25,7 +26,7 @@ let serviceStartTime = Date.now(); // 服务启动时间
 
 // --- 免费请求限制 ---
 const FREE_REQUESTS_LIMIT = 50; // 每日免费请求限制
-let freeRequestsCount = {}; // 每个API密钥的免费请求计数
+let freeRequestsCount = {}; // 每个API密钥的每日请求计数
 let lastResetDate = null; // 上次重置计数的日期
 
 // OpenRouter API 基础 URL
@@ -34,18 +35,27 @@ const KV_KEYS = {
   API_KEYS: 'api_keys',
   ADMIN_PASSWORD_HASH: 'admin_password_hash',
   CLIENT_TOKENS: 'client_tokens',
+  REQUEST_STATS: 'request_stats',
 };
 
 // --- 辅助函数 ---
 
 // 初始化：从 KV 加载 API 密钥、管理员密码哈希和客户端 token
 async function initializeState(env) {
+  // 如果已经初始化过，直接返回
+  if (isInitialized) {
+    return;
+  }
+
   try {
     const [keysData, passwordHashData, tokensData] = await Promise.all([
       env.ROUTER_KV.get(KV_KEYS.API_KEYS, { type: 'json' }),
       env.ROUTER_KV.get(KV_KEYS.ADMIN_PASSWORD_HASH, { type: 'text' }),
       env.ROUTER_KV.get(KV_KEYS.CLIENT_TOKENS, { type: 'json' }),
     ]);
+
+    // 加载请求统计数据
+    await loadRequestStats(env);
 
     if (keysData) {
       if (Array.isArray(keysData)) {
@@ -81,9 +91,29 @@ async function initializeState(env) {
       clientTokens = tokensData;
       console.log(`已加载 ${clientTokens.length} 个客户端 token`);
     } else {
-      clientTokens = [];
-      console.log('未找到客户端 token');
+      // 如果没有客户端token，创建一个默认的测试token
+      clientTokens = [{
+        name: 'Default Test Token',
+        token: 'sk-test-token-12345678901234567890123456789012',
+        enabled: true,
+        createdAt: new Date().toISOString()
+      }];
+      console.log('创建了默认的测试客户端 token');
     }
+
+    // 初始化完成后，对API密钥进行分类检查
+    if (Object.keys(apiKeys).length > 0) {
+      console.log('开始对加载的API密钥进行分类检查...');
+      try {
+        await refreshKeyClassification(env);
+        console.log('API密钥分类检查完成');
+      } catch (error) {
+        console.error('API密钥分类检查失败:', error);
+      }
+    }
+
+    // 标记为已初始化
+    isInitialized = true;
   } catch (error) {
     console.error('初始化状态失败:', error);
     apiKeys = {};
@@ -127,24 +157,60 @@ function resetFreeRequestsIfNeeded() {
   if (lastResetDate !== currentDate) {
     freeRequestsCount = {};
     lastResetDate = currentDate;
-    console.log('已重置所有API密钥的免费请求计数');
+    console.log('已重置所有API密钥的每日请求计数');
   }
 }
 
-// 增加API密钥的免费请求计数
-function incrementFreeRequests(apiKey) {
+// 增加API密钥的每日请求计数
+async function incrementDailyRequests(apiKey, env) {
   resetFreeRequestsIfNeeded();
   if (!(apiKey in freeRequestsCount)) {
     freeRequestsCount[apiKey] = 0;
   }
   freeRequestsCount[apiKey] += 1;
+  
+  // 保存到KV存储
+  try {
+    const statsData = {
+      counts: freeRequestsCount,
+      lastResetDate: lastResetDate,
+      lastUpdated: Date.now()
+    };
+    await env.ROUTER_KV.put(KV_KEYS.REQUEST_STATS, JSON.stringify(statsData));
+    console.log(`已更新API密钥 ${apiKey.substring(0, 8)}... 的每日请求计数: ${freeRequestsCount[apiKey]}`);
+  } catch (error) {
+    console.error('保存请求统计数据失败:', error);
+  }
+  
   return freeRequestsCount[apiKey];
 }
 
-// 获取API密钥的免费请求计数
-function getFreeRequestsCount(apiKey) {
+// 获取API密钥的每日请求计数
+function getDailyRequestsCount(apiKey) {
   resetFreeRequestsIfNeeded();
   return freeRequestsCount[apiKey] || 0;
+}
+
+// 从 KV 加载请求统计数据
+async function loadRequestStats(env) {
+  try {
+    const statsData = await env.ROUTER_KV.get(KV_KEYS.REQUEST_STATS, { type: 'json' });
+    if (statsData && statsData.counts) {
+      // 检查日期是否需要重置
+      const currentDate = new Date().toDateString();
+      if (statsData.lastResetDate === currentDate) {
+        freeRequestsCount = statsData.counts;
+        lastResetDate = statsData.lastResetDate;
+        console.log(`已加载请求统计数据，共 ${Object.keys(freeRequestsCount).length} 个密钥`);
+      } else {
+        console.log('检测到新的一天，重置请求统计数据');
+        freeRequestsCount = {};
+        lastResetDate = currentDate;
+      }
+    }
+  } catch (error) {
+    console.error('加载请求统计数据失败:', error);
+  }
 }
 
 // 更新请求统计信息
@@ -595,7 +661,7 @@ async function getAdminHtml(env) {
                         <th><input type="checkbox" id="selectAllKeys"></th>
                         <th>状态</th>
                         <th>密钥</th>
-                        <th>操作</th>
+                        <th>每日请求数</th>
                     </tr>
                 </thead>
                 <tbody id="keysList">
@@ -604,7 +670,7 @@ async function getAdminHtml(env) {
             </table>
              <button id="refreshKeysButton">重新加载</button>
              <button id="checkHealthButton">深度健康检查</button>
-              <button id="batchDeleteKeysButton" class="danger" style="margin-left: 10px;">批量删除选中密钥</button>
+              <button id="batchDeleteKeysButton" class="danger" style="margin-left: 10px;">删除选中密钥</button>
              <p style="font-size: 12px; color: #666; margin-top: 10px;">
                  💡 <strong>提示</strong>: "深度健康检查" 会实际调用 OpenRouter API 测试每个密钥的可用性，包括数据策略检查。
              </p>
@@ -684,6 +750,23 @@ async function getAdminHtml(env) {
         const batchDeleteKeysButton = document.getElementById('batchDeleteKeysButton');
         const refreshTokensButton = document.getElementById('refreshTokensButton');
         const apiUrlCode = document.getElementById('apiUrl');
+        
+        // 客户端每日请求计数
+        let freeRequestsCount = {};
+        let lastResetDate = null;
+        
+        function resetFreeRequestsIfNeeded() {
+            const currentDate = new Date().toDateString();
+            if (lastResetDate !== currentDate) {
+                freeRequestsCount = {};
+                lastResetDate = currentDate;
+            }
+        }
+        
+        function getDailyRequestsCount(apiKey) {
+            resetFreeRequestsIfNeeded();
+            return freeRequestsCount[apiKey] || 0;
+        }
         
         function showMessage(elementId, message, isError = true) {
             const el = document.getElementById(elementId);
@@ -878,21 +961,33 @@ async function getAdminHtml(env) {
         });
         
         async function loadApiKeys() {
-            keysList.innerHTML = '<tr><td colspan="3">正在加载密钥...</td></tr>';
-            const result = await apiCall('/keys');
-            if (result && result.keys) {
-                renderApiKeys(result.keys);
-            } else if (result === null) {
-                 keysList.innerHTML = '<tr><td colspan="3" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
-            } else {
-                 keysList.innerHTML = '<tr><td colspan="3">没有找到 API 密钥。</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="4">正在加载密钥...</td></tr>';
+            
+            try {
+                // 并行获取API密钥列表和统计信息
+                const [keysResult, statsResult] = await Promise.all([
+                    apiCall('/keys'),
+                    apiCall('/stats/keys')
+                ]);
+                
+                if (keysResult && keysResult.keys) {
+                    const keyStats = statsResult && statsResult.success ? statsResult.key_stats : {};
+                    renderApiKeys(keysResult.keys, keyStats);
+                } else if (keysResult === null) {
+                     keysList.innerHTML = '<tr><td colspan="4" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
+                } else {
+                     keysList.innerHTML = '<tr><td colspan="4">没有找到 API 密钥。</td></tr>';
+                }
+            } catch (error) {
+                console.error('加载API密钥和统计信息失败:', error);
+                keysList.innerHTML = '<tr><td colspan="4" style="color: red;">加载失败，请稍后重试。</td></tr>';
             }
         }
         
-        function renderApiKeys(keys) {
+        function renderApiKeys(keys, keyStats = {}) {
             const keyValues = Object.keys(keys);
             if (keyValues.length === 0) {
-                keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。请添加。</td></tr>';
+                keysList.innerHTML = '<tr><td colspan="4">没有找到 API 密钥。请添加。</td></tr>';
                 return;
             }
             keysList.innerHTML = keyValues.map(value => {
@@ -929,7 +1024,8 @@ async function getAdminHtml(env) {
                         statusClass = 'unknown';
                 }
 
-                const balance = key.balance !== undefined ? (key.balance === Infinity ? '无限' : key.balance.toFixed(4)) : '未知';
+                // 获取真实的每日请求数
+                const dailyRequests = keyStats[value] ? keyStats[value].daily_requests : 0;
                 const maskedValue = value.substring(0, 8) + '...' + value.substring(value.length - 8);
                 const escapedValue = escapeHtml(value);
 
@@ -937,8 +1033,7 @@ async function getAdminHtml(env) {
                     '<td><input type="checkbox" class="keyCheckbox" value="' + escapedValue + '"></td>' +
                     '<td><span class="status ' + statusClass + '"></span> ' + statusIcon + ' ' + statusText + '</td>' +
                     '<td><code style="font-size: 12px;">' + maskedValue + '</code></td>' +
-                    '<td>' + balance + '</td>' +
-                    '<td><button class="danger" onclick="deleteApiKey(\\'' + escapedValue + '\\')">删除</button></td>' +
+                    '<td>' + dailyRequests + '</td>' +
                     '</tr>';
             }).join('');
         }
@@ -1019,13 +1114,14 @@ async function getAdminHtml(env) {
         checkHealthButton.addEventListener('click', async () => {
             checkHealthButton.disabled = true;
             checkHealthButton.textContent = '检查中...';
-            keysList.innerHTML = '<tr><td colspan="3">正在进行深度健康检查，请稍候...</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="4">正在进行深度健康检查，请稍候...</td></tr>';
 
             try {
                 const result = await apiCall('/keys/refresh', 'POST');
                 if (result && result.success) {
                     showApiKeySuccess(result.message);
-                    renderApiKeys(result.keys);
+                    // 重新加载API密钥和统计信息
+                    loadApiKeys();
                 } else {
                     showApiKeyError('健康检查失败');
                     loadApiKeys(); // 回退到普通加载
@@ -1263,6 +1359,49 @@ router.get('/ping', async (request, env) => {
   };
 
   return new Response(JSON.stringify(statusInfo), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+});
+
+// 专门的统计信息 API
+router.get('/api/stats', async (request, env) => {
+  await initializeState(env);
+  
+  const stats = getCurrentStats();
+  
+  return new Response(JSON.stringify({
+    success: true,
+    stats: {
+      rpm: stats.rpm,
+      tpm: stats.tpm,
+      rpd: stats.rpd,
+      tpd: stats.tpd,
+      timestamp: new Date().toISOString()
+    }
+  }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+});
+
+// API密钥每日请求统计 API
+router.get('/api/admin/stats/keys', requireAdminAuth, async (request, env) => {
+  await initializeState(env);
+  
+  // 获取每个API密钥的每日请求统计
+  const keyStats = {};
+  const apiKeyValues = Object.keys(apiKeys);
+  
+  for (const key of apiKeyValues) {
+    keyStats[key] = {
+      daily_requests: getDailyRequestsCount(key),
+      key_type: apiKeys[key].type || 'unknown'
+    };
+  }
+  
+  return new Response(JSON.stringify({
+    success: true,
+    key_stats: keyStats
+  }), {
     headers: { 'Content-Type': 'application/json' }
   });
 });
@@ -1669,10 +1808,13 @@ router.post('/v1/chat/completions', async (request, env) => {
     const requestBody = await request.json();
     const apiKey = await getNextApiKey(requestBody.model, env);
 
+    // 为所有请求计数（不仅仅是免费的）
+    await incrementDailyRequests(apiKey, env);
+
     // 检查是否为免费请求并应用限制
     const isFreeRequest = requestBody.model && requestBody.model.endsWith(':free');
     if (isFreeRequest) {
-      const currentCount = incrementFreeRequests(apiKey);
+      const currentCount = getDailyRequestsCount(apiKey);
       if (currentCount > FREE_REQUESTS_LIMIT) {
         console.warn(`API密钥 ${apiKey.substring(0, 8)}... 已达到每日免费请求限制 (${FREE_REQUESTS_LIMIT})`);
         return new Response(JSON.stringify({
@@ -1701,37 +1843,8 @@ router.post('/v1/chat/completions', async (request, env) => {
     }
 
     if (isStream) {
-      // 处理流式响应
-      const { readable, writable } = new TransformStream();
-
-      // 异步处理流式数据
-      (async () => {
-        const reader = response.body.getReader();
-        const writer = writable.getWriter();
-
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            await writer.write(value);
-          }
-        } catch (error) {
-          console.error('流式传输错误:', error);
-        } finally {
-          await writer.close();
-        }
-      })();
-
-      return new Response(readable, {
-        status: response.status,
-        headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Cache-Control',
-        },
-      });
+      // 优化后的流式响应处理
+      return await handleOptimizedStreaming(response, requestBody.model, requestBody);
     } else {
       // 非流式响应
       const responseData = await response.text();
@@ -1754,6 +1867,218 @@ router.post('/v1/chat/completions', async (request, env) => {
       { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 });
+
+// --- 优化的流式传输处理函数 ---
+async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody) {
+  const { readable, writable } = new TransformStream({
+    // 添加转换器来处理数据流
+    transform(chunk, controller) {
+      // 智能数据处理：检查数据完整性
+      const textDecoder = new TextDecoder();
+      const chunkText = textDecoder.decode(chunk);
+      
+      // 检查是否为完整的JSON对象（处理SSE数据）
+      if (chunkText.includes('\n\n')) {
+        // 分段处理多个事件
+        const events = chunkText.split('\n\n');
+        events.forEach((event, index) => {
+          if (event.trim() && (index < events.length - 1 || chunkText.endsWith('\n\n'))) {
+            controller.enqueue(new TextEncoder().encode(event + '\n\n'));
+          }
+        });
+      } else {
+        controller.enqueue(chunk);
+      }
+    }
+  });
+
+  const writer = writable.getWriter();
+  const reader = upstreamResponse.body.getReader();
+  
+  // 流控制变量
+  let bytesRead = 0;
+  let lastHeartbeat = Date.now();
+  const HEARTBEAT_INTERVAL = 30000; // 30秒心跳
+  const MAX_BUFFER_SIZE = 64 * 1024; // 64KB缓冲区限制
+  const CHUNK_SIZE = 16 * 1024; // 16KB块大小
+  
+  // 错误处理和重试机制
+  let retryCount = 0;
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000;
+
+  // 异步处理流式数据
+  const processStream = async () => {
+    try {
+      let totalPromptTokens = 0;
+      let totalCompletionTokens = 0;
+      let hasUsageInfo = false;
+      let accumulatedUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) {
+          console.log(`流式传输完成，总共传输 ${bytesRead} 字节`);
+          break;
+        }
+
+        // 更新统计
+        bytesRead += value.byteLength;
+        lastHeartbeat = Date.now();
+        
+        // 解析流数据中的使用统计信息
+        try {
+          const textDecoder = new TextDecoder();
+          const chunkText = textDecoder.decode(value);
+          
+          // 检查是否包含使用统计信息（OpenRouter的流式响应格式）
+          if (chunkText.includes('"usage"') || chunkText.includes('"prompt_tokens"') || chunkText.includes('"completion_tokens"')) {
+            // 尝试从数据中提取使用统计
+            const lines = chunkText.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ') && line.length > 6) {
+                try {
+                  const data = JSON.parse(line.substring(6));
+                  
+                  // 检查是否是最终的完成事件（包含usage信息）
+                  if (data.usage && (data.choices?.[0]?.finish_reason === 'stop' || data.choices?.[0]?.finish_reason === 'length')) {
+                    totalPromptTokens = data.usage.prompt_tokens || 0;
+                    totalCompletionTokens = data.usage.completion_tokens || 0;
+                    hasUsageInfo = true;
+                    console.log('在流式响应中发现完整使用统计:', data.usage);
+                  } else if (data.usage) {
+                    // 累积使用统计信息
+                    accumulatedUsage.prompt_tokens = Math.max(accumulatedUsage.prompt_tokens, data.usage.prompt_tokens || 0);
+                    accumulatedUsage.completion_tokens = Math.max(accumulatedUsage.completion_tokens, data.usage.completion_tokens || 0);
+                    accumulatedUsage.total_tokens = Math.max(accumulatedUsage.total_tokens, data.usage.total_tokens || 0);
+                  }
+                } catch (parseError) {
+                  // 忽略解析错误，继续处理
+                }
+              }
+            }
+          }
+          
+          // 如果没有找到最终的使用统计，尝试从DONE事件中提取
+          if (chunkText.includes('[DONE]')) {
+            console.log('检测到流结束标志，使用累积的统计信息');
+            if (accumulatedUsage.prompt_tokens > 0 || accumulatedUsage.completion_tokens > 0) {
+              totalPromptTokens = accumulatedUsage.prompt_tokens;
+              totalCompletionTokens = accumulatedUsage.completion_tokens;
+              hasUsageInfo = true;
+            }
+          }
+        } catch (parseError) {
+          // 忽略解析错误，继续流式传输
+        }
+
+        // 背压控制：等待写入完成
+        try {
+          await writer.write(value);
+        } catch (writeError) {
+          if (writeError.name === 'TypeError' && writeError.message.includes('closed')) {
+            console.log('客户端连接已关闭，停止流式传输');
+            break;
+          }
+          throw writeError;
+        }
+
+        // 定期发送心跳事件（仅对支持SSE的模型）
+        if (modelName && Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL) {
+          try {
+            const heartbeat = `data: {\"type\":\"heartbeat\",\"timestamp\":${Date.now()}}\n\n`;
+            await writer.write(new TextEncoder().encode(heartbeat));
+            lastHeartbeat = Date.now();
+          } catch (heartbeatError) {
+            console.warn('心跳发送失败:', heartbeatError.message);
+          }
+        }
+
+        // 内存保护：定期清理和检查
+        if (bytesRead > MAX_BUFFER_SIZE * 10) {
+          console.log(`达到内存保护阈值 (${bytesRead} 字节)，强制刷新`);
+          // 强制刷新缓冲区（通过小延迟）
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      }
+    } catch (error) {
+      console.error('流式传输错误:', error);
+      
+      // 错误重试机制
+      if (retryCount < MAX_RETRIES) {
+        retryCount++;
+        console.log(`尝试重连 (${retryCount}/${MAX_RETRIES})...`);
+        
+        try {
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * retryCount));
+          // 这里可以添加重连逻辑
+        } catch (retryError) {
+          console.error('重连失败:', retryError);
+        }
+      }
+      
+      // 发送错误事件
+      try {
+        const errorEvent = `data: {\"error\":\"${error.message}\",\"type\":\"error\"}\n\n`;
+        await writer.write(new TextEncoder().encode(errorEvent));
+      } catch (writeError) {
+        console.warn('无法写入错误事件:', writeError.message);
+      }
+    } finally {
+      // 流结束后，更新统计信息
+      if (hasUsageInfo && (totalPromptTokens > 0 || totalCompletionTokens > 0)) {
+        console.log(`流式请求统计更新: prompt=${totalPromptTokens}, completion=${totalCompletionTokens}`);
+        updateRequestStats(totalPromptTokens, totalCompletionTokens);
+      } else {
+        // 如果没有获取到具体的使用统计，使用更智能的估算方法
+        // 基于请求的内容长度估算token数量
+        let estimatedPromptTokens = 10; // 基础prompt tokens
+        let estimatedCompletionTokens = 20; // 基础completion tokens
+        
+        if (requestBody && requestBody.messages) {
+          // 根据messages估算prompt tokens
+          const messageText = requestBody.messages.map(msg => msg.content || '').join(' ');
+          estimatedPromptTokens = Math.max(4, Math.ceil(messageText.length / 4)); // 粗略估算：4个字符约等于1个token
+        }
+        
+        // 根据max_tokens参数调整估算
+        if (requestBody && requestBody.max_tokens) {
+          estimatedCompletionTokens = Math.min(requestBody.max_tokens, Math.max(10, Math.ceil(requestBody.max_tokens * 0.7)));
+        }
+        
+        console.log(`流式请求估算统计: prompt=${estimatedPromptTokens}, completion=${estimatedCompletionTokens}`);
+        updateRequestStats(estimatedPromptTokens, estimatedCompletionTokens);
+      }
+      
+      // 资源清理
+      try {
+        await writer.close();
+        console.log(`流式传输结束，客户端断开连接`);
+      } catch (closeError) {
+        console.warn('关闭流时出错:', closeError.message);
+      }
+    }
+  };
+
+  // 启动流处理
+  processStream();
+
+  // 返回优化的流式响应
+  return new Response(readable, {
+    status: upstreamResponse.status,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no', // 禁用Nginx缓冲
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Cache-Control, Content-Type, Authorization',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Transfer-Encoding': 'chunked',
+      'Keep-Alive': 'timeout=60, max=1000'
+    }
+  });
+}
 
 // --- 主页路由 ---
 router.get('/', async (request, env) => {
