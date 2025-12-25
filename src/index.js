@@ -4,11 +4,29 @@ import { Router } from 'itty-router';
 const router = Router();
 
 // --- 全局变量 ---
-let apiKeys = {}; // 缓存 API 密钥，键为密钥值，值为 {isHealthy}
+let apiKeys = {}; // 缓存 API 密钥，键为密钥值，值为 {type, balance, isHealthy, usage, limit}
 let currentKeyIndex = 0;
 let lastHealthCheck = 0;
 let adminPasswordHash = null; // 缓存管理员密码哈希
 let clientTokens = []; // 缓存客户端访问 token
+let keyStatus = {
+  "invalid": [],
+  "free": [],
+  "unverified": [],
+  "valid": []
+};
+
+// --- 请求统计变量 ---
+let requestTimestamps = []; // 请求时间戳数组 (用于RPM计算)
+let tokenCounts = []; // token数量数组 (用于TPM计算)
+let requestTimestampsDay = []; // 每日请求时间戳数组 (用于RPD计算)
+let tokenCountsDay = []; // 每日token数量数组 (用于TPD计算)
+let serviceStartTime = Date.now(); // 服务启动时间
+
+// --- 免费请求限制 ---
+const FREE_REQUESTS_LIMIT = 50; // 每日免费请求限制
+let freeRequestsCount = {}; // 每个API密钥的免费请求计数
+let lastResetDate = null; // 上次重置计数的日期
 
 // OpenRouter API 基础 URL
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -68,7 +86,7 @@ async function initializeState(env) {
     }
   } catch (error) {
     console.error('初始化状态失败:', error);
-    apiKeys = [];
+    apiKeys = {};
     adminPasswordHash = null;
     clientTokens = [];
   }
@@ -99,6 +117,157 @@ function verifyClientToken(token) {
     return false;
   }
   return clientTokens.some(tokenObj => tokenObj.token === token && tokenObj.enabled);
+}
+
+// --- 统计和限制辅助函数 ---
+
+// 重置免费请求计数（每天执行一次）
+function resetFreeRequestsIfNeeded() {
+  const currentDate = new Date().toDateString();
+  if (lastResetDate !== currentDate) {
+    freeRequestsCount = {};
+    lastResetDate = currentDate;
+    console.log('已重置所有API密钥的免费请求计数');
+  }
+}
+
+// 增加API密钥的免费请求计数
+function incrementFreeRequests(apiKey) {
+  resetFreeRequestsIfNeeded();
+  if (!(apiKey in freeRequestsCount)) {
+    freeRequestsCount[apiKey] = 0;
+  }
+  freeRequestsCount[apiKey] += 1;
+  return freeRequestsCount[apiKey];
+}
+
+// 获取API密钥的免费请求计数
+function getFreeRequestsCount(apiKey) {
+  resetFreeRequestsIfNeeded();
+  return freeRequestsCount[apiKey] || 0;
+}
+
+// 更新请求统计信息
+function updateRequestStats(promptTokens, completionTokens) {
+  const currentTime = Date.now();
+  const totalTokens = promptTokens + completionTokens;
+
+  // 更新RPM/TPM统计 (最近1分钟)
+  requestTimestamps.push(currentTime);
+  tokenCounts.push(totalTokens);
+
+  // 更新RPD/TPD统计 (最近24小时)
+  requestTimestampsDay.push(currentTime);
+  tokenCountsDay.push(totalTokens);
+
+  // 清理过期数据
+  const oneMinuteAgo = currentTime - 60 * 1000;
+  const oneDayAgo = currentTime - 24 * 60 * 60 * 1000;
+
+  // 清理1分钟统计
+  while (requestTimestamps.length > 0 && requestTimestamps[0] < oneMinuteAgo) {
+    requestTimestamps.shift();
+    tokenCounts.shift();
+  }
+
+  // 清理24小时统计
+  while (requestTimestampsDay.length > 0 && requestTimestampsDay[0] < oneDayAgo) {
+    requestTimestampsDay.shift();
+    tokenCountsDay.shift();
+  }
+}
+
+// 获取当前统计信息
+function getCurrentStats() {
+  const currentTime = Date.now();
+  const oneMinuteAgo = currentTime - 60 * 1000;
+  const oneDayAgo = currentTime - 24 * 60 * 60 * 1000;
+
+  // 计算RPM和TPM
+  let recentRequests = 0;
+  let recentTokens = 0;
+  for (let i = requestTimestamps.length - 1; i >= 0; i--) {
+    if (requestTimestamps[i] >= oneMinuteAgo) {
+      recentRequests++;
+      recentTokens += tokenCounts[i];
+    } else {
+      break;
+    }
+  }
+
+  // 计算RPD和TPD
+  let dailyRequests = 0;
+  let dailyTokens = 0;
+  for (let i = requestTimestampsDay.length - 1; i >= 0; i--) {
+    if (requestTimestampsDay[i] >= oneDayAgo) {
+      dailyRequests++;
+      dailyTokens += tokenCountsDay[i];
+    } else {
+      break;
+    }
+  }
+
+  return {
+    rpm: recentRequests,
+    tpm: recentTokens,
+    rpd: dailyRequests,
+    tpd: dailyTokens
+  };
+}
+
+// 获取API密钥的信用额度信息
+async function getCreditSummary(apiKey) {
+  try {
+    const response = await fetch(`${OPENROUTER_BASE_URL}/auth/key`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      console.error(`获取额度信息失败，API Key：${apiKey.substring(0, 8)}...，状态码：${response.status}`);
+      return null;
+    }
+
+    const data = await response.json().catch(() => null);
+    if (!data || !data.data) {
+      console.error(`解析额度信息失败，API Key：${apiKey.substring(0, 8)}...`);
+      return null;
+    }
+
+    // 解析OpenRouter返回的数据
+    const usage = data.data.usage || 0;
+    const limit = data.data.limit;
+    const limitRemaining = data.data.limit_remaining;
+    const isFreeTier = data.data.is_free_tier || false;
+    const rateLimit = data.data.rate_limit || {};
+
+    // 计算余额
+    let totalBalance;
+    if (limitRemaining !== null && limitRemaining !== undefined) {
+      totalBalance = limitRemaining;
+    } else if (limit !== null && limit !== undefined) {
+      totalBalance = limit - usage;
+    } else {
+      // 如果是免费用户且没有limit信息，设置余额为0
+      totalBalance = isFreeTier ? 0 : Infinity;
+    }
+
+    console.log(`获取额度，API Key：${apiKey.substring(0, 8)}...，当前额度: ${totalBalance}, 使用量: ${usage}, 限额: ${limit}, 剩余限额: ${limitRemaining}, 是否免费用户: ${isFreeTier}`);
+
+    return {
+      total_balance: totalBalance,
+      usage,
+      limit,
+      limit_remaining: limitRemaining,
+      is_free_tier: isFreeTier,
+      rate_limit: rateLimit
+    };
+  } catch (error) {
+    console.error(`获取额度信息异常，API Key：${apiKey.substring(0, 8)}...，错误：${error}`);
+    return null;
+  }
 }
 
 // 生成随机 token
@@ -136,88 +305,194 @@ async function requireAdminAuth(request, env) {
   return undefined;
 }
 
-// 检查 API 密钥健康状态
-async function checkKeyHealth(key) {
+// 分类API密钥并检查健康状态
+async function classifyAndCheckKey(key) {
   try {
-    // 1. 基础连通性检查 - 获取模型列表
-    const modelsResponse = await fetch(`${OPENROUTER_BASE_URL}/models`, {
-      headers: {
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    if (!modelsResponse.ok) {
-      console.log(`密钥 ${key.substring(0, 8)}... 基础检查失败:`, modelsResponse.status);
-      return false;
+    // 获取信用额度信息
+    const creditSummary = await getCreditSummary(key);
+    if (!creditSummary) {
+      console.log(`密钥 ${key.substring(0, 8)}... 无效，无法获取额度信息`);
+      return 'invalid';
     }
 
-    // 2. 实际调用检查 - 测试一个常用的免费模型
-    const testResponse = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'deepseek/deepseek-r1-0528:free',
-        messages: [{ role: 'user', content: 'test' }],
-        max_tokens: 1
-      })
-    });
+    const totalBalance = creditSummary.total_balance;
 
-    // 检查是否是数据策略错误
-    if (!testResponse.ok) {
-      const errorText = await testResponse.text();
-      if (errorText.includes('No endpoints found matching your data policy')) {
-        console.log(`密钥 ${key.substring(0, 8)}... 数据策略限制，无法访问免费模型`);
-        return false;
+    // 分类密钥
+    if (totalBalance <= 0.03) {
+      // 余额很少的密钥认为是免费密钥
+      console.log(`密钥 ${key.substring(0, 8)}... 余额很少，分类为免费密钥`);
+      return 'free';
+    } else {
+      // 有余额的密钥，测试可用性
+      try {
+        // 1. 基础连通性检查 - 获取模型列表
+        const modelsResponse = await fetch(`${OPENROUTER_BASE_URL}/models`, {
+          headers: {
+            'Authorization': `Bearer ${key}`,
+            'Content-Type': 'application/json',
+          },
+        });
+
+        if (!modelsResponse.ok) {
+          console.log(`密钥 ${key.substring(0, 8)}... 模型列表检查失败:`, modelsResponse.status);
+          return 'unverified';
+        }
+
+        // 2. 实际调用检查 - 测试一个常用的模型
+        const testResponse = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${key}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'deepseek/deepseek-r1-0528:free',
+            messages: [{ role: 'user', content: 'test' }],
+            max_tokens: 1
+          })
+        });
+
+        // 检查是否是数据策略错误
+        if (!testResponse.ok) {
+          const errorText = await testResponse.text();
+          if (errorText.includes('No endpoints found matching your data policy')) {
+            console.log(`密钥 ${key.substring(0, 8)}... 数据策略限制，无法访问免费模型`);
+            return 'unverified';
+          }
+          // 其他错误（如余额不足）也认为未验证
+          console.log(`密钥 ${key.substring(0, 8)}... 实际调用失败:`, testResponse.status);
+          return 'unverified';
+        }
+
+        console.log(`密钥 ${key.substring(0, 8)}... 健康检查通过，分类为有效密钥`);
+        return 'valid';
+      } catch (error) {
+        console.error(`密钥 ${key.substring(0, 8)}... 健康检查异常:`, error);
+        return 'unverified';
       }
-      // 其他错误（如余额不足）也认为是不健康
-      console.log(`密钥 ${key.substring(0, 8)}... 实际调用失败:`, testResponse.status);
-      return false;
     }
-
-    console.log(`密钥 ${key.substring(0, 8)}... 健康检查通过`);
-    return true;
   } catch (error) {
-    console.error('健康检查失败:', error);
-    return false;
+    console.error(`密钥 ${key.substring(0, 8)}... 分类检查失败:`, error);
+    return 'invalid';
   }
 }
 
-// 获取下一个可用的 API 密钥
-async function getNextApiKey() {
-  const keyValues = Object.keys(apiKeys);
-  if (keyValues.length === 0) {
-    throw new Error('没有可用的 API 密钥');
+// 根据请求类型选择合适的密钥
+function selectKey(requestType, modelName) {
+  let availableKeys = [];
+
+  if (requestType === 'free') {
+    // 免费请求可以使用免费、未验证或有效密钥
+    availableKeys = [
+      ...keyStatus.free,
+      ...keyStatus.unverified,
+      ...keyStatus.valid
+    ];
+  } else if (requestType === 'paid') {
+    // 付费请求只能使用未验证或有效密钥
+    availableKeys = [
+      ...keyStatus.unverified,
+      ...keyStatus.valid
+    ];
+  } else {
+    // 未知请求类型，使用所有可用密钥
+    availableKeys = [
+      ...keyStatus.free,
+      ...keyStatus.unverified,
+      ...keyStatus.valid
+    ];
   }
 
-  // 每6小时检查一次健康状态
-  const now = Date.now();
-  if (now - lastHealthCheck > 6 * 60 * 60 * 1000) {
-    console.log('执行 API 密钥健康检查...');
-    for (const value of keyValues) {
-      apiKeys[value].isHealthy = await checkKeyHealth(value);
-    }
-    lastHealthCheck = now;
+  if (availableKeys.length === 0) {
+    return null;
   }
 
-  // 寻找健康的密钥
-  const healthyKeyValues = keyValues.filter(value => apiKeys[value].isHealthy !== false);
-  if (healthyKeyValues.length === 0) {
-    throw new Error('没有健康的 API 密钥可用');
-  }
-
-  // 轮询使用健康的密钥
-  const keyToUse = healthyKeyValues[currentKeyIndex % healthyKeyValues.length];
-  currentKeyIndex = (currentKeyIndex + 1) % healthyKeyValues.length;
+  // 使用轮询策略选择密钥
+  const keyToUse = availableKeys[currentKeyIndex % availableKeys.length];
+  currentKeyIndex = (currentKeyIndex + 1) % availableKeys.length;
 
   return keyToUse;
 }
 
+// 获取下一个可用的 API 密钥
+async function getNextApiKey(modelName = null, env) {
+  if (keyStatus.valid.length === 0 && keyStatus.free.length === 0 && keyStatus.unverified.length === 0) {
+    throw new Error('没有可用的 API 密钥');
+  }
+
+  // 每6小时检查一次健康状态并重新分类
+  const now = Date.now();
+  if (now - lastHealthCheck > 6 * 60 * 60 * 1000) {
+    console.log('执行 API 密钥健康检查和重新分类...');
+    await refreshKeyClassification(env);
+    lastHealthCheck = now;
+  }
+
+  // 确定请求类型
+  let requestType = 'unknown';
+  if (modelName && modelName.endsWith(':free')) {
+    requestType = 'free';
+  } else if (modelName) {
+    requestType = 'paid';
+  }
+
+  // 选择合适的密钥
+  const keyToUse = selectKey(requestType, modelName);
+  if (!keyToUse) {
+    throw new Error(`没有找到适合 ${requestType} 请求类型的API密钥`);
+  }
+
+  console.log(`选择密钥 ${keyToUse.substring(0, 8)}... 用于 ${requestType} 请求`);
+  return keyToUse;
+}
+
+// 刷新密钥分类
+async function refreshKeyClassification(env) {
+  // 清空分类
+  keyStatus.invalid.length = 0;
+  keyStatus.free.length = 0;
+  keyStatus.unverified.length = 0;
+  keyStatus.valid.length = 0;
+
+  const keyValues = Object.keys(apiKeys);
+  console.log(`开始重新分类 ${keyValues.length} 个API密钥...`);
+
+  for (let i = 0; i < keyValues.length; i++) {
+    const key = keyValues[i];
+    console.log(`检查密钥 ${i + 1}/${keyValues.length}: ${key.substring(0, 8)}...`);
+
+    const keyType = await classifyAndCheckKey(key);
+    if (keyStatus[keyType]) {
+      keyStatus[keyType].push(key);
+    }
+
+    // 更新密钥信息
+    const creditSummary = await getCreditSummary(key);
+    if (creditSummary) {
+      apiKeys[key] = {
+        type: keyType,
+        balance: creditSummary.total_balance,
+        usage: creditSummary.usage,
+        limit: creditSummary.limit,
+        isHealthy: keyType === 'valid' || keyType === 'unverified',
+        lastChecked: Date.now()
+      };
+    }
+  }
+
+  // 保存更新后的状态
+  await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+
+  console.log(`密钥分类完成: 有效 ${keyStatus.valid.length}, 免费 ${keyStatus.free.length}, 未验证 ${keyStatus.unverified.length}, 无效 ${keyStatus.invalid.length}`);
+}
+
 // 获取管理页面 HTML 内容
 async function getAdminHtml(env) {
+  await initializeState(env);
+
+  // 获取当前统计信息
+  const stats = getCurrentStats();
+
   const htmlContent = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -278,6 +553,32 @@ async function getAdminHtml(env) {
              <h2>管理</h2>
              <button id="logoutButton">退出登录</button>
         </div>
+
+        <div class="container" style="background: #e8f4f8; border: 1px solid #bee5eb;">
+            <h3>📊 请求统计</h3>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 15px;">
+                <div style="text-align: center; padding: 10px; background: white; border-radius: 5px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #007bff;">${stats.rpm}</div>
+                    <div style="font-size: 12px; color: #666;">每分钟请求数 (RPM)</div>
+                </div>
+                <div style="text-align: center; padding: 10px; background: white; border-radius: 5px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #28a745;">${stats.tpm}</div>
+                    <div style="font-size: 12px; color: #666;">每分钟Token数 (TPM)</div>
+                </div>
+                <div style="text-align: center; padding: 10px; background: white; border-radius: 5px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #dc3545;">${stats.rpd}</div>
+                    <div style="font-size: 12px; color: #666;">每日请求数 (RPD)</div>
+                </div>
+                <div style="text-align: center; padding: 10px; background: white; border-radius: 5px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #ffc107;">${stats.tpd}</div>
+                    <div style="font-size: 12px; color: #666;">每日Token数 (TPD)</div>
+                </div>
+            </div>
+            <p style="font-size: 12px; color: #666; margin: 0;">
+                💡 <strong>统计说明:</strong> RPM/TPM显示最近1分钟内的数据，RPD/TPD显示最近24小时内的数据。
+            </p>
+        </div>
+
         <div class="container">
             <h3>API 密钥管理 (OpenRouter)</h3>
             <div id="apiKeyError" class="error-message hidden"></div>
@@ -591,25 +892,52 @@ async function getAdminHtml(env) {
         function renderApiKeys(keys) {
             const keyValues = Object.keys(keys);
             if (keyValues.length === 0) {
-                keysList.innerHTML = '<tr><td colspan="3">没有找到 API 密钥。请添加。</td></tr>';
+                keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。请添加。</td></tr>';
                 return;
             }
             keysList.innerHTML = keyValues.map(value => {
                 const key = keys[value];
-                const statusClass = key.isHealthy === true ? 'healthy' : (key.isHealthy === false ? 'unhealthy' : 'unknown');
-                let statusText = key.isHealthy === true ? '✅ 可用' : (key.isHealthy === false ? '❌ 不可用' : '⚪ 未检测');
+                const keyType = key.type || 'unknown';
+                let statusIcon = '';
+                let statusText = '';
+                let statusClass = 'unknown';
 
-                // 如果是不可用状态，添加更多信息
-                if (key.isHealthy === false) {
-                    statusText += '<br><small style="color: #999;">可能原因: 数据策略限制、余额不足或密钥无效</small>';
+                switch (keyType) {
+                    case 'valid':
+                        statusIcon = '✅';
+                        statusText = '有效';
+                        statusClass = 'healthy';
+                        break;
+                    case 'free':
+                        statusIcon = '💰';
+                        statusText = '免费';
+                        statusClass = 'healthy';
+                        break;
+                    case 'unverified':
+                        statusIcon = '⚠️';
+                        statusText = '未验证';
+                        statusClass = 'unknown';
+                        break;
+                    case 'invalid':
+                        statusIcon = '❌';
+                        statusText = '无效';
+                        statusClass = 'unhealthy';
+                        break;
+                    default:
+                        statusIcon = '⚪';
+                        statusText = '未知';
+                        statusClass = 'unknown';
                 }
 
+                const balance = key.balance !== undefined ? (key.balance === Infinity ? '无限' : key.balance.toFixed(4)) : '未知';
                 const maskedValue = value.substring(0, 8) + '...' + value.substring(value.length - 8);
                 const escapedValue = escapeHtml(value);
+
                 return '<tr>' +
                     '<td><input type="checkbox" class="keyCheckbox" value="' + escapedValue + '"></td>' +
-                    '<td><span class="status ' + statusClass + '"></span> ' + statusText + '</td>' +
+                    '<td><span class="status ' + statusClass + '"></span> ' + statusIcon + ' ' + statusText + '</td>' +
                     '<td><code style="font-size: 12px;">' + maskedValue + '</code></td>' +
+                    '<td>' + balance + '</td>' +
                     '<td><button class="danger" onclick="deleteApiKey(\\'' + escapedValue + '\\')">删除</button></td>' +
                     '</tr>';
             }).join('');
@@ -873,6 +1201,72 @@ async function getAdminHtml(env) {
 
 // --- API 路由 ---
 
+// --- 健康监控和统计 API ---
+router.get('/ping', async (request, env) => {
+  await initializeState(env);
+
+  const uptime = Date.now() - serviceStartTime;
+  const uptimeStr = new Date(uptime).toISOString().substr(11, 8); // HH:MM:SS format
+
+  const stats = getCurrentStats();
+
+  // 统计API密钥数量
+  const validKeysCount = keyStatus.valid.length;
+  const freeKeysCount = keyStatus.free.length;
+  const unverifiedKeysCount = keyStatus.unverified.length;
+  const totalKeys = Object.keys(apiKeys).length;
+
+  // 统计模型数量（简化版，从OpenRouter获取）
+  let modelsCount = 0;
+  try {
+    const apiKey = await getNextApiKey(null, env);
+    const modelsResponse = await fetch(`${OPENROUTER_BASE_URL}/models`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    if (modelsResponse.ok) {
+      const modelsData = await modelsResponse.json();
+      modelsCount = modelsData.data ? modelsData.data.length : 0;
+    }
+  } catch (error) {
+    console.error('获取模型数量失败:', error);
+  }
+
+  const statusInfo = {
+    status: "running",
+    service: {
+      start_time: new Date(serviceStartTime).toISOString(),
+      uptime: uptimeStr,
+    },
+    system: {
+      platform: "Cloudflare Worker",
+      version: "1.0.0"
+    },
+    api_keys: {
+      valid: validKeysCount,
+      free: freeKeysCount,
+      unverified: unverifiedKeysCount,
+      total: totalKeys
+    },
+    models: {
+      total: modelsCount
+    },
+    requests: {
+      per_minute: stats.rpm,
+      per_day: stats.rpd,
+      tokens_per_minute: stats.tpm,
+      tokens_per_day: stats.tpd
+    },
+    timestamp: new Date().toISOString()
+  };
+
+  return new Response(JSON.stringify(statusInfo), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+});
+
 // --- 管理员认证 API ---
 router.get('/api/admin/auth/status', async (request, env) => {
   await initializeState(env);
@@ -962,25 +1356,29 @@ router.get('/api/admin/keys', requireAdminAuth, async (request, env) => {
 router.post('/api/admin/keys/refresh', requireAdminAuth, async (request, env) => {
   await initializeState(env);
   try {
-    console.log('开始手动刷新所有密钥健康状态...');
-    const keyValues = Object.keys(apiKeys);
-    for (let i = 0; i < keyValues.length; i++) {
-      const value = keyValues[i];
-      console.log(`检查密钥 ${i + 1}/${keyValues.length}: ${value.substring(0, 8)}...`);
-      apiKeys[value].isHealthy = await checkKeyHealth(value);
-    }
-
-    // 保存更新后的状态
-    await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+    console.log('开始手动刷新所有密钥状态和分类...');
+    await refreshKeyClassification(env);
     lastHealthCheck = Date.now();
 
-    const healthyCount = Object.values(apiKeys).filter(key => key.isHealthy).length;
-    console.log(`健康检查完成: ${healthyCount}/${keyValues.length} 个密钥可用`);
+    const validCount = keyStatus.valid.length;
+    const freeCount = keyStatus.free.length;
+    const unverifiedCount = keyStatus.unverified.length;
+    const invalidCount = keyStatus.invalid.length;
+    const totalKeys = Object.keys(apiKeys).length;
+
+    console.log(`密钥分类完成: 有效 ${validCount}, 免费 ${freeCount}, 未验证 ${unverifiedCount}, 无效 ${invalidCount}`);
 
     return new Response(JSON.stringify({
       success: true,
-      message: `健康检查完成: ${healthyCount}/${keyValues.length} 个密钥可用`,
-      keys: apiKeys
+      message: `密钥检查完成: 有效 ${validCount}, 免费 ${freeCount}, 未验证 ${unverifiedCount}, 无效 ${invalidCount}`,
+      keys: apiKeys,
+      status: {
+        valid: validCount,
+        free: freeCount,
+        unverified: unverifiedCount,
+        invalid: invalidCount,
+        total: totalKeys
+      }
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -1006,14 +1404,40 @@ router.post('/api/admin/keys', requireAdminAuth, async (request, env) => {
       return new Response(JSON.stringify({ error: '密钥已存在' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
 
-    // 检查密钥健康状态
-    const isHealthy = await checkKeyHealth(value);
-    apiKeys[value] = { isHealthy };
+    // 分类并检查密钥
+    console.log(`添加新密钥: ${value.substring(0, 8)}...`);
+    const keyType = await classifyAndCheckKey(value);
+
+    // 添加到密钥状态分类
+    if (keyStatus[keyType]) {
+      keyStatus[keyType].push(value);
+    }
+
+    // 获取信用额度信息
+    const creditSummary = await getCreditSummary(value);
+    apiKeys[value] = {
+      type: keyType,
+      balance: creditSummary ? creditSummary.total_balance : 0,
+      usage: creditSummary ? creditSummary.usage : 0,
+      limit: creditSummary ? creditSummary.limit : 0,
+      isHealthy: keyType === 'valid' || keyType === 'unverified',
+      lastChecked: Date.now()
+    };
 
     // 保存到 KV
     await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
-    return new Response(JSON.stringify({ success: true, message: 'API 密钥添加成功', key: { value, isHealthy } }), {
+    console.log(`密钥 ${value.substring(0, 8)}... 添加成功，分类为: ${keyType}`);
+    return new Response(JSON.stringify({
+      success: true,
+      message: 'API 密钥添加成功',
+      key: {
+        value,
+        type: keyType,
+        balance: apiKeys[value].balance,
+        isHealthy: apiKeys[value].isHealthy
+      }
+    }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -1202,7 +1626,7 @@ router.get('/v1/models', async (request, env) => {
   }
 
   try {
-    const apiKey = await getNextApiKey();
+    const apiKey = await getNextApiKey(null, env);
     const response = await fetch(`${OPENROUTER_BASE_URL}/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -1242,8 +1666,20 @@ router.post('/v1/chat/completions', async (request, env) => {
   }
 
   try {
-    const apiKey = await getNextApiKey();
     const requestBody = await request.json();
+    const apiKey = await getNextApiKey(requestBody.model, env);
+
+    // 检查是否为免费请求并应用限制
+    const isFreeRequest = requestBody.model && requestBody.model.endsWith(':free');
+    if (isFreeRequest) {
+      const currentCount = incrementFreeRequests(apiKey);
+      if (currentCount > FREE_REQUESTS_LIMIT) {
+        console.warn(`API密钥 ${apiKey.substring(0, 8)}... 已达到每日免费请求限制 (${FREE_REQUESTS_LIMIT})`);
+        return new Response(JSON.stringify({
+          error: { message: 'Daily free request limit exceeded', type: 'rate_limit_error' }
+        }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
 
     // 检查是否为流式请求
     const isStream = requestBody.stream === true;
@@ -1299,6 +1735,14 @@ router.post('/v1/chat/completions', async (request, env) => {
     } else {
       // 非流式响应
       const responseData = await response.text();
+      const responseJson = JSON.parse(responseData);
+
+      // 更新统计信息
+      const usage = responseJson.usage || {};
+      const promptTokens = usage.prompt_tokens || 0;
+      const completionTokens = usage.completion_tokens || 0;
+      updateRequestStats(promptTokens, completionTokens);
+
       return new Response(responseData, {
         status: response.status,
         headers: { 'Content-Type': 'application/json' }
