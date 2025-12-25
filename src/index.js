@@ -1844,7 +1844,7 @@ router.post('/v1/chat/completions', async (request, env) => {
 
     if (isStream) {
       // 优化后的流式响应处理
-      return await handleOptimizedStreaming(response, requestBody.model, requestBody);
+      return await handleOptimizedStreaming(response, requestBody.model, requestBody, env);
     } else {
       // 非流式响应
       const responseData = await response.text();
@@ -1869,7 +1869,7 @@ router.post('/v1/chat/completions', async (request, env) => {
 });
 
 // --- 优化的流式传输处理函数 ---
-async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody) {
+async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody, env) {
   const { readable, writable } = new TransformStream({
     // 添加转换器来处理数据流
     transform(chunk, controller) {
