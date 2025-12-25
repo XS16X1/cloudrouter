@@ -4,11 +4,12 @@ import { Router } from 'itty-router';
 const router = Router();
 
 // --- 全局变量 ---
-let apiKeys = []; // 缓存 API 密钥
+let apiKeys = {}; // 缓存 API 密钥，键为密钥值，值为 {isHealthy}
 let currentKeyIndex = 0;
 let lastHealthCheck = 0;
 let adminPasswordHash = null; // 缓存管理员密码哈希
 let clientTokens = []; // 缓存客户端访问 token
+let dailyRequestStats = {}; // 每日请求统计，键为密钥值，值为请求次数
 
 // OpenRouter API 基础 URL
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -16,6 +17,7 @@ const KV_KEYS = {
   API_KEYS: 'api_keys',
   ADMIN_PASSWORD_HASH: 'admin_password_hash',
   CLIENT_TOKENS: 'client_tokens',
+  DAILY_REQUEST_STATS: 'daily_request_stats',
 };
 
 // --- 辅助函数 ---
@@ -23,17 +25,32 @@ const KV_KEYS = {
 // 初始化：从 KV 加载 API 密钥、管理员密码哈希和客户端 token
 async function initializeState(env) {
   try {
-    const [keysData, passwordHashData, tokensData] = await Promise.all([
+    const [keysData, passwordHashData, tokensData, statsData] = await Promise.all([
       env.ROUTER_KV.get(KV_KEYS.API_KEYS, { type: 'json' }),
       env.ROUTER_KV.get(KV_KEYS.ADMIN_PASSWORD_HASH, { type: 'text' }),
       env.ROUTER_KV.get(KV_KEYS.CLIENT_TOKENS, { type: 'json' }),
+      getDailyRequestStats(env),
     ]);
 
-    if (keysData && Array.isArray(keysData)) {
-      apiKeys = keysData;
-      console.log(`已加载 ${apiKeys.length} 个API密钥`);
+    if (keysData) {
+      if (Array.isArray(keysData)) {
+        // 迁移旧格式：从数组转换为对象
+        apiKeys = {};
+        keysData.forEach(key => {
+          if (key.value && typeof key.value === 'string') {
+            apiKeys[key.value] = { isHealthy: key.isHealthy !== false };
+          }
+        });
+        console.log(`已迁移 ${Object.keys(apiKeys).length} 个API密钥到新格式`);
+        // 保存新格式
+        await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+      } else if (typeof keysData === 'object') {
+        // 新格式
+        apiKeys = keysData;
+        console.log(`已加载 ${Object.keys(apiKeys).length} 个API密钥`);
+      }
     } else {
-      apiKeys = [];
+      apiKeys = {};
       console.log('未找到API密钥');
     }
 
@@ -52,11 +69,15 @@ async function initializeState(env) {
       clientTokens = [];
       console.log('未找到客户端 token');
     }
+
+    dailyRequestStats = statsData;
+    console.log(`已加载今日请求统计，共 ${Object.keys(dailyRequestStats).length} 个密钥有请求记录`);
   } catch (error) {
     console.error('初始化状态失败:', error);
-    apiKeys = [];
+    apiKeys = {};
     adminPasswordHash = null;
     clientTokens = [];
+    dailyRequestStats = {};
   }
 }
 
@@ -95,6 +116,40 @@ function generateToken() {
     result += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return result;
+}
+
+// 获取今日日期字符串 (YYYY-MM-DD)
+function getTodayDateString() {
+  const today = new Date();
+  const year = today.getFullYear();
+  const month = String(today.getMonth() + 1).padStart(2, '0');
+  const day = String(today.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// 异步获取每日请求统计
+async function getDailyRequestStats(env) {
+  try {
+    const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
+    const stats = await env.ROUTER_KV.get(todayKey, { type: 'json' });
+    return stats || {};
+  } catch (error) {
+    console.error('获取每日请求统计失败:', error);
+    return {};
+  }
+}
+
+// 异步更新每日请求统计
+async function incrementRequestCount(env, keyValue) {
+  try {
+    const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
+    const stats = await getDailyRequestStats(env);
+    stats[keyValue] = (stats[keyValue] || 0) + 1;
+    await env.ROUTER_KV.put(todayKey, JSON.stringify(stats));
+    dailyRequestStats = stats; // 更新内存缓存
+  } catch (error) {
+    console.error('更新请求计数失败:', error);
+  }
 }
 
 // 管理员认证中间件
@@ -173,8 +228,9 @@ async function checkKeyHealth(key) {
 }
 
 // 获取下一个可用的 API 密钥
-async function getNextApiKey() {
-  if (apiKeys.length === 0) {
+async function getNextApiKey(env) {
+  const keyValues = Object.keys(apiKeys);
+  if (keyValues.length === 0) {
     throw new Error('没有可用的 API 密钥');
   }
 
@@ -182,23 +238,23 @@ async function getNextApiKey() {
   const now = Date.now();
   if (now - lastHealthCheck > 5 * 60 * 1000) {
     console.log('执行 API 密钥健康检查...');
-    for (let i = 0; i < apiKeys.length; i++) {
-      apiKeys[i].isHealthy = await checkKeyHealth(apiKeys[i].value);
+    for (const value of keyValues) {
+      apiKeys[value].isHealthy = await checkKeyHealth(value);
     }
     lastHealthCheck = now;
   }
 
   // 寻找健康的密钥
-  const healthyKeys = apiKeys.filter(key => key.isHealthy !== false);
-  if (healthyKeys.length === 0) {
+  const healthyKeyValues = keyValues.filter(value => apiKeys[value].isHealthy !== false);
+  if (healthyKeyValues.length === 0) {
     throw new Error('没有健康的 API 密钥可用');
   }
 
   // 轮询使用健康的密钥
-  const keyToUse = healthyKeys[currentKeyIndex % healthyKeys.length];
-  currentKeyIndex = (currentKeyIndex + 1) % healthyKeys.length;
-  
-  return keyToUse.value;
+  const keyToUse = healthyKeyValues[currentKeyIndex % healthyKeyValues.length];
+  currentKeyIndex = (currentKeyIndex + 1) % healthyKeyValues.length;
+
+  return keyToUse;
 }
 
 // 获取管理页面 HTML 内容
@@ -217,7 +273,7 @@ async function getAdminHtml(env) {
         button:hover { background-color: #2980b9; }
         button.danger { background-color: #e74c3c; }
         button.danger:hover { background-color: #c0392b; }
-        input[type="text"], input[type="password"] { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; }
+        input[type="text"], input[type="password"], textarea { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
@@ -268,25 +324,28 @@ async function getAdminHtml(env) {
             <div id="apiKeyError" class="error-message hidden"></div>
             <div id="apiKeySuccess" class="success-message hidden"></div>
             <form id="addKeyForm" style="margin-bottom: 15px;">
-                <label for="keyValue">密钥值 (sk-...)，支持批量输入（用逗号或换行分隔）:</label>
-                <textarea id="keyValue" placeholder="sk-...&#10;sk-..." rows="4" style="width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px;" required></textarea>
-                <button type="submit">添加密钥</button>
+                <label for="keyValue">密钥值 (每行一个，格式 sk-...):</label>
+                <textarea id="keyValue" rows="3" placeholder="sk-abc123...&#10;sk-def456..." required></textarea>
+                <button type="submit">批量添加密钥</button>
             </form>
             <h4>现有密钥:</h4>
             <table id="keysTable">
                 <thead>
                     <tr>
+                        <th><input type="checkbox" id="selectAllKeys"></th>
                         <th>状态</th>
-                        <th>密钥标识</th>
+                        <th>密钥</th>
+                        <th>今日请求</th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="keysList">
-                    <tr><td colspan="3">正在加载...</td></tr>
+                    <tr><td colspan="4">正在加载...</td></tr>
                 </tbody>
             </table>
              <button id="refreshKeysButton">重新加载</button>
              <button id="checkHealthButton">深度健康检查</button>
+              <button id="batchDeleteKeysButton" class="danger" style="margin-left: 10px;">批量删除选中密钥</button>
              <p style="font-size: 12px; color: #666; margin-top: 10px;">
                  💡 <strong>提示</strong>: "深度健康检查" 会实际调用 OpenRouter API 测试每个密钥的可用性，包括数据策略检查。
              </p>
@@ -363,6 +422,7 @@ async function getAdminHtml(env) {
         const logoutButton = document.getElementById('logoutButton');
         const refreshKeysButton = document.getElementById('refreshKeysButton');
         const checkHealthButton = document.getElementById('checkHealthButton');
+        const batchDeleteKeysButton = document.getElementById('batchDeleteKeysButton');
         const refreshTokensButton = document.getElementById('refreshTokensButton');
         const apiUrlCode = document.getElementById('apiUrl');
         
@@ -559,23 +619,25 @@ async function getAdminHtml(env) {
         });
         
         async function loadApiKeys() {
-            keysList.innerHTML = '<tr><td colspan="3">正在加载密钥...</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="5">正在加载密钥...</td></tr>';
             const result = await apiCall('/keys');
             if (result && result.keys) {
                 renderApiKeys(result.keys);
             } else if (result === null) {
-                 keysList.innerHTML = '<tr><td colspan="3" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
+                 keysList.innerHTML = '<tr><td colspan="5" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
             } else {
-                 keysList.innerHTML = '<tr><td colspan="3">没有找到 API 密钥。</td></tr>';
+                 keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。</td></tr>';
             }
         }
         
         function renderApiKeys(keys) {
-            if (keys.length === 0) {
-                keysList.innerHTML = '<tr><td colspan="3">没有找到 API 密钥。请添加。</td></tr>';
+            const keyValues = Object.keys(keys);
+            if (keyValues.length === 0) {
+                keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。请添加。</td></tr>';
                 return;
             }
-            keysList.innerHTML = keys.map(key => {
+            keysList.innerHTML = keyValues.map(value => {
+                const key = keys[value];
                 const statusClass = key.isHealthy === true ? 'healthy' : (key.isHealthy === false ? 'unhealthy' : 'unknown');
                 let statusText = key.isHealthy === true ? '✅ 可用' : (key.isHealthy === false ? '❌ 不可用' : '⚪ 未检测');
 
@@ -584,11 +646,15 @@ async function getAdminHtml(env) {
                     statusText += '<br><small style="color: #999;">可能原因: 数据策略限制、余额不足或密钥无效</small>';
                 }
 
-                const escapedName = escapeHtml(key.name);
+                const maskedValue = value.substring(0, 8) + '...' + value.substring(value.length - 8);
+                const escapedValue = escapeHtml(value);
+                const requestCount = dailyRequestStats[value] || 0;
                 return '<tr>' +
+                    '<td><input type="checkbox" class="keyCheckbox" value="' + escapedValue + '"></td>' +
                     '<td><span class="status ' + statusClass + '"></span> ' + statusText + '</td>' +
-                    '<td>' + escapedName + '</td>' +
-                    '<td><button class="danger" onclick="deleteApiKey(\\'' + escapedName + '\\')">删除</button></td>' +
+                    '<td><code style="font-size: 12px;">' + maskedValue + '</code></td>' +
+                    '<td>' + requestCount + '</td>' +
+                    '<td><button class="danger" onclick="deleteApiKey(\\'' + escapedValue + '\\')">删除</button></td>' +
                     '</tr>';
             }).join('');
         }
@@ -605,88 +671,58 @@ async function getAdminHtml(env) {
         
         addKeyForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            const inputValue = document.getElementById('keyValue').value.trim();
+            const value = document.getElementById('keyValue').value.trim();
 
-            if (!inputValue) {
+            if (!value) {
                 showApiKeyError('密钥值不能为空。');
                 return;
             }
 
-            // 解析批量输入：支持逗号和换行分隔
-            const values = inputValue.split(/[,\\n]+/).map(v => v.trim()).filter(v => v);
-            if (values.length === 0) {
+            // 分割多行密钥
+            const keys = value.split('\\n').map(k => k.trim()).filter(k => k);
+
+            if (keys.length === 0) {
                 showApiKeyError('密钥值不能为空。');
                 return;
             }
 
-            // 验证每个密钥
-            for (const value of values) {
-                if (!value.startsWith('sk-')) {
+            // 检查所有密钥格式
+            for (const key of keys) {
+                if (!key.startsWith('sk-')) {
                     showApiKeyError('OpenRouter API 密钥通常以 "sk-" 开头。');
                     return;
                 }
             }
 
-            // 检查输入中是否有重复
-            const uniqueValues = [...new Set(values)];
-            if (uniqueValues.length !== values.length) {
-                showApiKeyError('输入中包含重复的密钥值，请检查。');
-                return;
-            }
-
-            // 获取现有密钥以检查重复
-            const keysData = await apiCall('/keys');
-            if (!keysData || !keysData.keys) {
-                showApiKeyError('无法获取现有密钥列表，请重试。');
-                return;
-            }
-            const existingValues = keysData.keys.map(k => k.value);
-
-            // 过滤出不重复的密钥
-            const newValues = uniqueValues.filter(v => !existingValues.includes(v));
-            if (newValues.length === 0) {
-                showApiKeyError('所有密钥都已存在，无需添加。');
-                return;
-            }
-
-            // 批量添加
+            // 批量添加密钥
             let successCount = 0;
-            let errorCount = 0;
-            for (const value of newValues) {
-                const result = await apiCall('/keys', 'POST', { value });
+            let errorMessages = [];
+
+            for (const key of keys) {
+                const result = await apiCall('/keys', 'POST', { value: key });
                 if (result && result.success) {
                     successCount++;
                 } else {
-                    errorCount++;
+                    errorMessages.push(result?.error || '未知错误');
                 }
             }
 
-            let skippedCount = values.length - newValues.length;
             if (successCount > 0) {
-                let message = '成功添加 ' + successCount + ' 个API密钥';
-                if (errorCount > 0) {
-                    message += '，失败 ' + errorCount + ' 个';
-                }
-                if (skippedCount > 0) {
-                    message += '，跳过 ' + skippedCount + ' 个已存在的密钥';
-                }
-                message += '！';
-                showApiKeySuccess(message);
+                showApiKeySuccess('成功添加 ' + successCount + ' 个API密钥！');
                 addKeyForm.reset();
                 loadApiKeys();
-            } else {
-                let message = '添加失败';
-                if (skippedCount > 0) {
-                    message += '（跳过 ' + skippedCount + ' 个已存在的密钥）';
-                }
-                showApiKeyError(message + '。');
+            }
+
+            if (errorMessages.length > 0) {
+                showApiKeyError('部分密钥添加失败: ' + errorMessages.join(', '));
             }
         });
         
-        async function deleteApiKey(name) {
-            if (!confirm('确定要删除密钥 "' + name + '" 吗？')) return;
-            
-            const result = await apiCall('/keys/' + encodeURIComponent(name), 'DELETE');
+        async function deleteApiKey(value) {
+            const maskedValue = value.substring(0, 8) + '...' + value.substring(value.length - 8);
+            if (!confirm('确定要删除密钥 "' + maskedValue + '" 吗？')) return;
+
+            const result = await apiCall('/keys/' + encodeURIComponent(value), 'DELETE');
             if (result && result.success) {
                 showApiKeySuccess('API 密钥删除成功！');
                 loadApiKeys();
@@ -699,7 +735,7 @@ async function getAdminHtml(env) {
         checkHealthButton.addEventListener('click', async () => {
             checkHealthButton.disabled = true;
             checkHealthButton.textContent = '检查中...';
-            keysList.innerHTML = '<tr><td colspan="3">正在进行深度健康检查，请稍候...</td></tr>';
+            keysList.innerHTML = '<tr><td colspan="5">正在进行深度健康检查，请稍候...</td></tr>';
 
             try {
                 const result = await apiCall('/keys/refresh', 'POST');
@@ -842,6 +878,36 @@ async function getAdminHtml(env) {
             }
         });
         
+        // 批量删除功能
+        batchDeleteKeysButton.addEventListener('click', async () => {
+            const checkboxes = document.querySelectorAll('.keyCheckbox:checked');
+            const selectedKeys = Array.from(checkboxes).map(cb => cb.value);
+
+            if (selectedKeys.length === 0) {
+                showApiKeyError('请选择要删除的密钥。');
+                return;
+            }
+
+            if (!confirm('确定要删除选中的 ' + selectedKeys.length + ' 个密钥吗？此操作不可撤销。')) {
+                return;
+            }
+
+            const result = await apiCall('/keys/batch-delete', 'POST', { keys: selectedKeys });
+            if (result && result.success) {
+                showApiKeySuccess('批量删除成功！删除了 ' + selectedKeys.length + ' 个密钥。');
+                loadApiKeys();
+            }
+        });
+
+        // 全选功能
+        const selectAllCheckbox = document.getElementById('selectAllKeys');
+        if (selectAllCheckbox) {
+            selectAllCheckbox.addEventListener('change', (e) => {
+                const checkboxes = document.querySelectorAll('.keyCheckbox');
+                checkboxes.forEach(cb => cb.checked = e.target.checked);
+            });
+        }
+
         document.addEventListener('DOMContentLoaded', checkAuthStatus);
     </script>
 </body>
@@ -941,21 +1007,23 @@ router.post('/api/admin/keys/refresh', requireAdminAuth, async (request, env) =>
   await initializeState(env);
   try {
     console.log('开始手动刷新所有密钥健康状态...');
-    for (let i = 0; i < apiKeys.length; i++) {
-      console.log(`检查密钥 ${i + 1}/${apiKeys.length}: ${apiKeys[i].name}`);
-      apiKeys[i].isHealthy = await checkKeyHealth(apiKeys[i].value);
+    const keyValues = Object.keys(apiKeys);
+    for (let i = 0; i < keyValues.length; i++) {
+      const value = keyValues[i];
+      console.log(`检查密钥 ${i + 1}/${keyValues.length}: ${value.substring(0, 8)}...`);
+      apiKeys[value].isHealthy = await checkKeyHealth(value);
     }
 
     // 保存更新后的状态
     await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
     lastHealthCheck = Date.now();
 
-    const healthyCount = apiKeys.filter(key => key.isHealthy).length;
-    console.log(`健康检查完成: ${healthyCount}/${apiKeys.length} 个密钥可用`);
+    const healthyCount = Object.values(apiKeys).filter(key => key.isHealthy).length;
+    console.log(`健康检查完成: ${healthyCount}/${keyValues.length} 个密钥可用`);
 
     return new Response(JSON.stringify({
       success: true,
-      message: `健康检查完成: ${healthyCount}/${apiKeys.length} 个密钥可用`,
+      message: `健康检查完成: ${healthyCount}/${keyValues.length} 个密钥可用`,
       keys: apiKeys
     }), {
       headers: { 'Content-Type': 'application/json' }
@@ -977,23 +1045,19 @@ router.post('/api/admin/keys', requireAdminAuth, async (request, env) => {
       return new Response(JSON.stringify({ error: '密钥值不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
 
-    // 自动生成密钥名称
-    let keyName;
-    let counter = 1;
-    do {
-      keyName = `API Key ${counter}`;
-      counter++;
-    } while (apiKeys.some(key => key.name === keyName));
+    // 检查是否已存在相同的密钥
+    if (value in apiKeys) {
+      return new Response(JSON.stringify({ error: '密钥已存在' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
 
     // 检查密钥健康状态
     const isHealthy = await checkKeyHealth(value);
-    const newKey = { name: keyName, value, isHealthy };
-    apiKeys.push(newKey);
+    apiKeys[value] = { isHealthy };
 
     // 保存到 KV
     await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
-    return new Response(JSON.stringify({ success: true, message: 'API 密钥添加成功', key: { name: keyName, isHealthy } }), {
+    return new Response(JSON.stringify({ success: true, message: 'API 密钥添加成功', key: { value, isHealthy } }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -1002,17 +1066,16 @@ router.post('/api/admin/keys', requireAdminAuth, async (request, env) => {
   }
 });
 
-router.delete('/api/admin/keys/:name', requireAdminAuth, async (request, env) => {
+router.delete('/api/admin/keys/:value', requireAdminAuth, async (request, env) => {
   await initializeState(env);
   try {
-    const { name } = request.params;
-    const keyIndex = apiKeys.findIndex(key => key.name === name);
+    const { value } = request.params;
 
-    if (keyIndex === -1) {
+    if (!(value in apiKeys)) {
       return new Response(JSON.stringify({ error: '密钥不存在' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
     }
 
-    apiKeys.splice(keyIndex, 1);
+    delete apiKeys[value];
     await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
     return new Response(JSON.stringify({ success: true, message: 'API 密钥删除成功' }), {
@@ -1021,6 +1084,41 @@ router.delete('/api/admin/keys/:name', requireAdminAuth, async (request, env) =>
   } catch (error) {
     console.error("删除 API 密钥失败:", error);
     return new Response(JSON.stringify({ error: '删除密钥时发生内部错误' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+});
+
+// 批量删除 API 密钥
+router.post('/api/admin/keys/batch-delete', requireAdminAuth, async (request, env) => {
+  await initializeState(env);
+  try {
+    const { keys } = await request.json();
+
+    if (!keys || !Array.isArray(keys) || keys.length === 0) {
+      return new Response(JSON.stringify({ error: '密钥列表不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    let deletedCount = 0;
+    for (const key of keys) {
+      if (key in apiKeys) {
+        delete apiKeys[key];
+        deletedCount++;
+      }
+    }
+
+    if (deletedCount > 0) {
+      await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      message: `成功删除 ${deletedCount} 个API密钥`,
+      deletedCount
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error("批量删除 API 密钥失败:", error);
+    return new Response(JSON.stringify({ error: '批量删除密钥时发生内部错误' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 });
 
@@ -1148,7 +1246,7 @@ router.get('/v1/models', async (request, env) => {
   }
 
   try {
-    const apiKey = await getNextApiKey();
+    const apiKey = await getNextApiKey(env);
     const response = await fetch(`${OPENROUTER_BASE_URL}/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -1188,7 +1286,7 @@ router.post('/v1/chat/completions', async (request, env) => {
   }
 
   try {
-    const apiKey = await getNextApiKey();
+    const apiKey = await getNextApiKey(env);
     const requestBody = await request.text();
 
     const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
