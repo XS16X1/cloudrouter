@@ -622,7 +622,7 @@ async function getAdminHtml(env) {
             keysList.innerHTML = '<tr><td colspan="5">正在加载密钥...</td></tr>';
             const result = await apiCall('/keys');
             if (result && result.keys) {
-                renderApiKeys(result.keys);
+                renderApiKeys(result.keys, result.dailyRequestStats || {});
             } else if (result === null) {
                  keysList.innerHTML = '<tr><td colspan="5" style="color: red;">加载密钥失败，请检查登录状态。</td></tr>';
             } else {
@@ -630,7 +630,7 @@ async function getAdminHtml(env) {
             }
         }
         
-        function renderApiKeys(keys) {
+        function renderApiKeys(keys, dailyRequestStats) {
             const keyValues = Object.keys(keys);
             if (keyValues.length === 0) {
                 keysList.innerHTML = '<tr><td colspan="5">没有找到 API 密钥。请添加。</td></tr>';
@@ -741,7 +741,7 @@ async function getAdminHtml(env) {
                 const result = await apiCall('/keys/refresh', 'POST');
                 if (result && result.success) {
                     showApiKeySuccess(result.message);
-                    renderApiKeys(result.keys);
+                    renderApiKeys(result.keys, {});
                 } else {
                     showApiKeyError('健康检查失败');
                     loadApiKeys(); // 回退到普通加载
@@ -997,7 +997,11 @@ router.post('/api/admin/auth/change-password', requireAdminAuth, async (request,
 // --- API 密钥管理 ---
 router.get('/api/admin/keys', requireAdminAuth, async (request, env) => {
   await initializeState(env);
-  return new Response(JSON.stringify({ success: true, keys: apiKeys }), {
+  return new Response(JSON.stringify({
+    success: true,
+    keys: apiKeys,
+    dailyRequestStats: dailyRequestStats
+  }), {
     headers: { 'Content-Type': 'application/json' }
   });
 });
