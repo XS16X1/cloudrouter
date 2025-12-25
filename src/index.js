@@ -141,14 +141,22 @@ async function getDailyRequestStats(env) {
 
 // 异步更新每日请求统计
 async function incrementRequestCount(env, keyValue) {
+  // 立即更新内存缓存，确保实时性
+  dailyRequestStats[keyValue] = (dailyRequestStats[keyValue] || 0) + 1;
+
+  // 异步保存到KV，不阻塞主流程
   try {
     const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
-    const stats = await getDailyRequestStats(env);
-    stats[keyValue] = (stats[keyValue] || 0) + 1;
-    await env.ROUTER_KV.put(todayKey, JSON.stringify(stats));
-    dailyRequestStats = stats; // 更新内存缓存
+    await env.ROUTER_KV.put(todayKey, JSON.stringify(dailyRequestStats));
   } catch (error) {
-    console.error('更新请求计数失败:', error);
+    console.error('保存请求计数到KV失败:', error);
+    // 如果保存失败，尝试重新加载以保持数据一致性
+    try {
+      const freshStats = await getDailyRequestStats(env);
+      dailyRequestStats = freshStats;
+    } catch (reloadError) {
+      console.error('重新加载请求统计失败:', reloadError);
+    }
   }
 }
 
@@ -741,7 +749,7 @@ async function getAdminHtml(env) {
                 const result = await apiCall('/keys/refresh', 'POST');
                 if (result && result.success) {
                     showApiKeySuccess(result.message);
-                    renderApiKeys(result.keys, {});
+                    renderApiKeys(result.keys, result.dailyRequestStats || {});
                 } else {
                     showApiKeyError('健康检查失败');
                     loadApiKeys(); // 回退到普通加载
@@ -1080,6 +1088,17 @@ router.delete('/api/admin/keys/:value', requireAdminAuth, async (request, env) =
     }
 
     delete apiKeys[value];
+    // 同时从统计数据中移除
+    if (value in dailyRequestStats) {
+      delete dailyRequestStats[value];
+      // 异步更新KV中的统计数据
+      try {
+        const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
+        await env.ROUTER_KV.put(todayKey, JSON.stringify(dailyRequestStats));
+      } catch (error) {
+        console.error('更新统计数据失败:', error);
+      }
+    }
     await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
     return new Response(JSON.stringify({ success: true, message: 'API 密钥删除成功' }), {
@@ -1105,12 +1124,23 @@ router.post('/api/admin/keys/batch-delete', requireAdminAuth, async (request, en
     for (const key of keys) {
       if (key in apiKeys) {
         delete apiKeys[key];
+        // 从统计数据中移除
+        if (key in dailyRequestStats) {
+          delete dailyRequestStats[key];
+        }
         deletedCount++;
       }
     }
 
     if (deletedCount > 0) {
       await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+      // 更新统计数据到KV
+      try {
+        const todayKey = KV_KEYS.DAILY_REQUEST_STATS + '_' + getTodayDateString();
+        await env.ROUTER_KV.put(todayKey, JSON.stringify(dailyRequestStats));
+      } catch (error) {
+        console.error('更新统计数据失败:', error);
+      }
     }
 
     return new Response(JSON.stringify({
@@ -1291,7 +1321,10 @@ router.post('/v1/chat/completions', async (request, env) => {
 
   try {
     const apiKey = await getNextApiKey(env);
-    const requestBody = await request.text();
+    const requestBody = await request.json();
+
+    // 检查是否启用流式响应
+    const isStreaming = requestBody.stream === true;
 
     const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
       method: 'POST',
@@ -1299,14 +1332,34 @@ router.post('/v1/chat/completions', async (request, env) => {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: requestBody,
+      body: JSON.stringify(requestBody),
     });
 
-    const responseData = await response.text();
-    return new Response(responseData, {
-      status: response.status,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('OpenRouter API 错误:', response.status, errorText);
+      return new Response(JSON.stringify({ error: { message: '上游API错误', type: 'api_error' } }),
+        { status: response.status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    if (isStreaming) {
+      // 流式响应：直接转发上游的流式响应
+      return new Response(response.body, {
+        status: response.status,
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        }
+      });
+    } else {
+      // 非流式响应：等待完整响应后返回
+      const responseData = await response.text();
+      return new Response(responseData, {
+        status: response.status,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   } catch (error) {
     console.error('聊天完成请求失败:', error);
     return new Response(JSON.stringify({ error: { message: '聊天完成请求失败', type: 'api_error' } }),
