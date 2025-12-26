@@ -20,25 +20,110 @@ let isInitialized = false; // 标记是否已经初始化
 // --- 请求统计变量 ---
 let requestTimestamps = []; // 请求时间戳数组 (用于RPM计算)
 let tokenCounts = []; // token数量数组 (用于TPM计算)
-let requestTimestampsDay = []; // 每日请求时间戳数组 (用于RPD计算)
-let tokenCountsDay = []; // 每日token数量数组 (用于TPD计算)
+let requestTimestampsDaily = []; // 每日请求时间戳数组 (用于RPD计算)
+let tokenCountsDaily = []; // 每日token数量数组 (用于TPD计算)
 let serviceStartTime = Date.now(); // 服务启动时间
 
 // --- 免费请求限制 ---
-const FREE_REQUESTS_LIMIT = 50; // 每日免费请求限制
 let freeRequestsCount = {}; // 每个API密钥的每日请求计数
 let lastResetDate = null; // 上次重置计数的日期
 
-// OpenRouter API 基础 URL
-const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
-const KV_KEYS = {
-  API_KEYS: 'api_keys',
-  ADMIN_PASSWORD_HASH: 'admin_password_hash',
-  CLIENT_TOKENS: 'client_tokens',
-  REQUEST_STATS: 'request_stats',
+// --- 常量定义 ---
+const CONSTANTS = {
+  OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1',
+  KV_KEYS: {
+    API_KEYS: 'api_keys',
+    ADMIN_PASSWORD_HASH: 'admin_password_hash',
+    CLIENT_TOKENS: 'client_tokens',
+    REQUEST_STATS: 'request_stats',
+  },
+  FREE_REQUESTS_LIMIT: 50,
+  HEALTH_CHECK_INTERVAL: 6 * 60 * 60 * 1000, // 6小时
+  HEARTBEAT_INTERVAL: 30000, // 30秒
+  MAX_BUFFER_SIZE: 64 * 1024, // 64KB
+  CHUNK_SIZE: 16 * 1024, // 16KB
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 1000
 };
 
 // --- 辅助函数 ---
+
+// 统一的错误响应生成器
+function createErrorResponse(message, status = 500, errorType = 'internal_error') {
+  return new Response(JSON.stringify({ 
+    error: { message, type: errorType } 
+  }), { 
+    status, 
+    headers: { 'Content-Type': 'application/json' } 
+  });
+}
+
+// 统一的成功响应生成器
+function createSuccessResponse(data = {}, message = '操作成功') {
+  return new Response(JSON.stringify({ 
+    success: true, 
+    message,
+    ...data 
+  }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// 统一的KV存储操作
+const KVOperations = {
+  async get(env, key, options = {}) {
+    return await env.ROUTER_KV.get(key, options);
+  },
+  async put(env, key, value) {
+    return await env.ROUTER_KV.put(key, value);
+  },
+  async getJSON(env, key) {
+    return await env.ROUTER_KV.get(key, { type: 'json' });
+  },
+  async getText(env, key) {
+    return await env.ROUTER_KV.get(key, { type: 'text' });
+  }
+};
+
+// 统一的API调用封装
+class ApiClient {
+  static async request(url, options = {}) {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+      throw new Error(`API请求失败: ${response.status} ${response.statusText}`);
+    }
+    return response;
+  }
+  
+  static async getJson(url, headers = {}) {
+    const response = await this.request(url, { headers });
+    return await response.json();
+  }
+  
+  static async postJson(url, data, headers = {}) {
+    const response = await this.request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(data)
+    });
+    return await response.json();
+  }
+}
+
+// 统一的日志记录器
+class Logger {
+  static error(message, error = null) {
+    console.error(message, error ? error : '');
+  }
+  
+  static info(message, data = null) {
+    console.log(message, data ? data : '');
+  }
+  
+  static warn(message, data = null) {
+    console.warn(message, data ? data : '');
+  }
+}
 
 // 初始化：从 KV 加载 API 密钥、管理员密码哈希和客户端 token
 async function initializeState(env) {
@@ -49,9 +134,9 @@ async function initializeState(env) {
 
   try {
     const [keysData, passwordHashData, tokensData] = await Promise.all([
-      env.ROUTER_KV.get(KV_KEYS.API_KEYS, { type: 'json' }),
-      env.ROUTER_KV.get(KV_KEYS.ADMIN_PASSWORD_HASH, { type: 'text' }),
-      env.ROUTER_KV.get(KV_KEYS.CLIENT_TOKENS, { type: 'json' }),
+      KVOperations.getJSON(env, CONSTANTS.KV_KEYS.API_KEYS),
+      KVOperations.getText(env, CONSTANTS.KV_KEYS.ADMIN_PASSWORD_HASH),
+      KVOperations.getJSON(env, CONSTANTS.KV_KEYS.CLIENT_TOKENS),
     ]);
 
     // 加载请求统计数据
@@ -68,7 +153,7 @@ async function initializeState(env) {
         });
         console.log(`已迁移 ${Object.keys(apiKeys).length} 个API密钥到新格式`);
         // 保存新格式
-        await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+        await KVOperations.put(env, CONSTANTS.KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
       } else if (typeof keysData === 'object') {
         // 新格式
         apiKeys = keysData;
@@ -176,7 +261,7 @@ async function incrementDailyRequests(apiKey, env) {
       lastResetDate: lastResetDate,
       lastUpdated: Date.now()
     };
-    await env.ROUTER_KV.put(KV_KEYS.REQUEST_STATS, JSON.stringify(statsData));
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.REQUEST_STATS, JSON.stringify(statsData));
     console.log(`已更新API密钥 ${apiKey.substring(0, 8)}... 的每日请求计数: ${freeRequestsCount[apiKey]}`);
   } catch (error) {
     console.error('保存请求统计数据失败:', error);
@@ -194,7 +279,7 @@ function getDailyRequestsCount(apiKey) {
 // 从 KV 加载请求统计数据
 async function loadRequestStats(env) {
   try {
-    const statsData = await env.ROUTER_KV.get(KV_KEYS.REQUEST_STATS, { type: 'json' });
+    const statsData = await KVOperations.getJSON(env, CONSTANTS.KV_KEYS.REQUEST_STATS);
     if (statsData && statsData.counts) {
       // 检查日期是否需要重置
       const currentDate = new Date().toDateString();
@@ -223,8 +308,8 @@ function updateRequestStats(promptTokens, completionTokens) {
   tokenCounts.push(totalTokens);
 
   // 更新RPD/TPD统计 (最近24小时)
-  requestTimestampsDay.push(currentTime);
-  tokenCountsDay.push(totalTokens);
+  requestTimestampsDaily.push(currentTime);
+  tokenCountsDaily.push(totalTokens);
 
   // 清理过期数据
   const oneMinuteAgo = currentTime - 60 * 1000;
@@ -237,9 +322,9 @@ function updateRequestStats(promptTokens, completionTokens) {
   }
 
   // 清理24小时统计
-  while (requestTimestampsDay.length > 0 && requestTimestampsDay[0] < oneDayAgo) {
-    requestTimestampsDay.shift();
-    tokenCountsDay.shift();
+  while (requestTimestampsDaily.length > 0 && requestTimestampsDaily[0] < oneDayAgo) {
+    requestTimestampsDaily.shift();
+    tokenCountsDaily.shift();
   }
 }
 
@@ -264,10 +349,10 @@ function getCurrentStats() {
   // 计算RPD和TPD
   let dailyRequests = 0;
   let dailyTokens = 0;
-  for (let i = requestTimestampsDay.length - 1; i >= 0; i--) {
-    if (requestTimestampsDay[i] >= oneDayAgo) {
+  for (let i = requestTimestampsDaily.length - 1; i >= 0; i--) {
+    if (requestTimestampsDaily[i] >= oneDayAgo) {
       dailyRequests++;
-      dailyTokens += tokenCountsDay[i];
+      dailyTokens += tokenCountsDaily[i];
     } else {
       break;
     }
@@ -284,7 +369,7 @@ function getCurrentStats() {
 // 获取API密钥的信用额度信息
 async function getCreditSummary(apiKey) {
   try {
-    const response = await fetch(`${OPENROUTER_BASE_URL}/auth/key`, {
+    const response = await fetch(`${CONSTANTS.OPENROUTER_BASE_URL}/auth/key`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -392,7 +477,7 @@ async function classifyAndCheckKey(key) {
       // 有余额的密钥，测试可用性
       try {
         // 1. 基础连通性检查 - 获取模型列表
-        const modelsResponse = await fetch(`${OPENROUTER_BASE_URL}/models`, {
+        const modelsResponse = await fetch(`${CONSTANTS.OPENROUTER_BASE_URL}/models`, {
           headers: {
             'Authorization': `Bearer ${key}`,
             'Content-Type': 'application/json',
@@ -405,7 +490,7 @@ async function classifyAndCheckKey(key) {
         }
 
         // 2. 实际调用检查 - 测试一个常用的模型
-        const testResponse = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+        const testResponse = await fetch(`${CONSTANTS.OPENROUTER_BASE_URL}/chat/completions`, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${key}`,
@@ -488,7 +573,7 @@ async function getNextApiKey(modelName = null, env) {
 
   // 每6小时检查一次健康状态并重新分类
   const now = Date.now();
-  if (now - lastHealthCheck > 6 * 60 * 60 * 1000) {
+  if (now - lastHealthCheck > CONSTANTS.HEALTH_CHECK_INTERVAL) {
     console.log('执行 API 密钥健康检查和重新分类...');
     await refreshKeyClassification(env);
     lastHealthCheck = now;
@@ -547,7 +632,7 @@ async function refreshKeyClassification(env) {
   }
 
   // 保存更新后的状态
-  await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+  await KVOperations.put(env, CONSTANTS.KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
   console.log(`密钥分类完成: 有效 ${keyStatus.valid.length}, 免费 ${keyStatus.free.length}, 未验证 ${keyStatus.unverified.length}, 无效 ${keyStatus.invalid.length}`);
 }
@@ -1316,7 +1401,7 @@ router.get('/ping', async (request, env) => {
   let modelsCount = 0;
   try {
     const apiKey = await getNextApiKey(null, env);
-    const modelsResponse = await fetch(`${OPENROUTER_BASE_URL}/models`, {
+    const modelsResponse = await fetch(`${CONSTANTS.OPENROUTER_BASE_URL}/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -1417,32 +1502,30 @@ router.get('/api/admin/auth/status', async (request, env) => {
 router.post('/api/admin/auth/setup', async (request, env) => {
   await initializeState(env);
   if (adminPasswordHash) {
-    return new Response(JSON.stringify({ error: '密码已设置' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    return createErrorResponse('密码已设置', 400, 'invalid_request_error');
   }
 
   try {
     const { password } = await request.json();
     if (!password || password.length < 8) {
-      return new Response(JSON.stringify({ error: '密码无效或太短（至少8位）' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      return createErrorResponse('密码无效或太短（至少8位）', 400, 'invalid_request_error');
     }
 
     const newHash = await hashPassword(password);
-    await env.ROUTER_KV.put(KV_KEYS.ADMIN_PASSWORD_HASH, newHash);
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.ADMIN_PASSWORD_HASH, newHash);
     adminPasswordHash = newHash;
 
-    return new Response(JSON.stringify({ success: true, message: '管理员密码设置成功' }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return createSuccessResponse({}, '管理员密码设置成功');
   } catch (error) {
-    console.error("密码设置失败:", error);
-    return new Response(JSON.stringify({ error: '设置密码时发生内部错误' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    Logger.error("密码设置失败:", error);
+    return createErrorResponse('设置密码时发生内部错误');
   }
 });
 
 router.post('/api/admin/auth/login', async (request, env) => {
   await initializeState(env);
   if (!adminPasswordHash) {
-    return new Response(JSON.stringify({ error: '管理员密码尚未设置' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+    return createErrorResponse('管理员密码尚未设置', 403, 'invalid_request_error');
   }
 
   try {
@@ -1450,15 +1533,13 @@ router.post('/api/admin/auth/login', async (request, env) => {
     const isValid = await verifyPassword(password, adminPasswordHash);
 
     if (isValid) {
-      return new Response(JSON.stringify({ success: true, message: '登录成功' }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      return createSuccessResponse({}, '登录成功');
     } else {
-      return new Response(JSON.stringify({ error: '密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      return createErrorResponse('密码错误', 401, 'invalid_request_error');
     }
   } catch (error) {
-     console.error("登录失败:", error);
-     return new Response(JSON.stringify({ error: '登录时发生内部错误' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    Logger.error("登录失败:", error);
+    return createErrorResponse('登录时发生内部错误');
   }
 });
 
@@ -1471,7 +1552,7 @@ router.post('/api/admin/auth/change-password', requireAdminAuth, async (request,
     }
 
     const newHash = await hashPassword(newPassword);
-    await env.ROUTER_KV.put(KV_KEYS.ADMIN_PASSWORD_HASH, newHash);
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.ADMIN_PASSWORD_HASH, newHash);
     adminPasswordHash = newHash;
 
     return new Response(JSON.stringify({ success: true, message: '密码修改成功' }), {
@@ -1564,7 +1645,7 @@ router.post('/api/admin/keys', requireAdminAuth, async (request, env) => {
     };
 
     // 保存到 KV
-    await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
     console.log(`密钥 ${value.substring(0, 8)}... 添加成功，分类为: ${keyType}`);
     return new Response(JSON.stringify({
@@ -1595,7 +1676,7 @@ router.delete('/api/admin/keys/:value', requireAdminAuth, async (request, env) =
     }
 
     delete apiKeys[value];
-    await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
 
     return new Response(JSON.stringify({ success: true, message: 'API 密钥删除成功' }), {
       headers: { 'Content-Type': 'application/json' }
@@ -1625,7 +1706,7 @@ router.post('/api/admin/keys/batch-delete', requireAdminAuth, async (request, en
     }
 
     if (deletedCount > 0) {
-      await env.ROUTER_KV.put(KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
+      await KVOperations.put(env, CONSTANTS.KV_KEYS.API_KEYS, JSON.stringify(apiKeys));
     }
 
     return new Response(JSON.stringify({
@@ -1687,7 +1768,7 @@ router.post('/api/admin/tokens', requireAdminAuth, async (request, env) => {
     clientTokens.push(newToken);
 
     // 保存到 KV
-    await env.ROUTER_KV.put(KV_KEYS.CLIENT_TOKENS, JSON.stringify(clientTokens));
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.CLIENT_TOKENS, JSON.stringify(clientTokens));
 
     return new Response(JSON.stringify({
       success: true,
@@ -1714,7 +1795,7 @@ router.patch('/api/admin/tokens/:name', requireAdminAuth, async (request, env) =
     }
 
     clientTokens[tokenIndex].enabled = enabled;
-    await env.ROUTER_KV.put(KV_KEYS.CLIENT_TOKENS, JSON.stringify(clientTokens));
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.CLIENT_TOKENS, JSON.stringify(clientTokens));
 
     return new Response(JSON.stringify({ success: true, message: 'Token 状态更新成功' }), {
       headers: { 'Content-Type': 'application/json' }
@@ -1736,7 +1817,7 @@ router.delete('/api/admin/tokens/:name', requireAdminAuth, async (request, env) 
     }
 
     clientTokens.splice(tokenIndex, 1);
-    await env.ROUTER_KV.put(KV_KEYS.CLIENT_TOKENS, JSON.stringify(clientTokens));
+    await KVOperations.put(env, CONSTANTS.KV_KEYS.CLIENT_TOKENS, JSON.stringify(clientTokens));
 
     return new Response(JSON.stringify({ success: true, message: 'Token 删除成功' }), {
       headers: { 'Content-Type': 'application/json' }
@@ -1766,7 +1847,7 @@ router.get('/v1/models', async (request, env) => {
 
   try {
     const apiKey = await getNextApiKey(null, env);
-    const response = await fetch(`${OPENROUTER_BASE_URL}/models`, {
+    const response = await fetch(`${CONSTANTS.OPENROUTER_BASE_URL}/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -1815,8 +1896,8 @@ router.post('/v1/chat/completions', async (request, env) => {
     const isFreeRequest = requestBody.model && requestBody.model.endsWith(':free');
     if (isFreeRequest) {
       const currentCount = getDailyRequestsCount(apiKey);
-      if (currentCount > FREE_REQUESTS_LIMIT) {
-        console.warn(`API密钥 ${apiKey.substring(0, 8)}... 已达到每日免费请求限制 (${FREE_REQUESTS_LIMIT})`);
+      if (currentCount > CONSTANTS.FREE_REQUESTS_LIMIT) {
+        console.warn(`API密钥 ${apiKey.substring(0, 8)}... 已达到每日免费请求限制 (${CONSTANTS.FREE_REQUESTS_LIMIT})`);
         return new Response(JSON.stringify({
           error: { message: 'Daily free request limit exceeded', type: 'rate_limit_error' }
         }), { status: 429, headers: { 'Content-Type': 'application/json' } });
@@ -1826,7 +1907,7 @@ router.post('/v1/chat/completions', async (request, env) => {
     // 检查是否为流式请求
     const isStream = requestBody.stream === true;
 
-    const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+    const response = await fetch(`${CONSTANTS.OPENROUTER_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -1898,14 +1979,9 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
   // 流控制变量
   let bytesRead = 0;
   let lastHeartbeat = Date.now();
-  const HEARTBEAT_INTERVAL = 30000; // 30秒心跳
-  const MAX_BUFFER_SIZE = 64 * 1024; // 64KB缓冲区限制
-  const CHUNK_SIZE = 16 * 1024; // 16KB块大小
   
   // 错误处理和重试机制
   let retryCount = 0;
-  const MAX_RETRIES = 3;
-  const RETRY_DELAY = 1000;
 
   // 异步处理流式数据
   const processStream = async () => {
@@ -1984,7 +2060,7 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
         }
 
         // 定期发送心跳事件（仅对支持SSE的模型）
-        if (modelName && Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL) {
+        if (modelName && Date.now() - lastHeartbeat > CONSTANTS.HEARTBEAT_INTERVAL) {
           try {
             const heartbeat = `data: {\"type\":\"heartbeat\",\"timestamp\":${Date.now()}}\n\n`;
             await writer.write(new TextEncoder().encode(heartbeat));
@@ -1995,7 +2071,7 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
         }
 
         // 内存保护：定期清理和检查
-        if (bytesRead > MAX_BUFFER_SIZE * 10) {
+        if (bytesRead > CONSTANTS.MAX_BUFFER_SIZE * 10) {
           console.log(`达到内存保护阈值 (${bytesRead} 字节)，强制刷新`);
           // 强制刷新缓冲区（通过小延迟）
           await new Promise(resolve => setTimeout(resolve, 10));
@@ -2005,12 +2081,12 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
       console.error('流式传输错误:', error);
       
       // 错误重试机制
-      if (retryCount < MAX_RETRIES) {
+      if (retryCount < CONSTANTS.MAX_RETRIES) {
         retryCount++;
-        console.log(`尝试重连 (${retryCount}/${MAX_RETRIES})...`);
+        console.log(`尝试重连 (${retryCount}/${CONSTANTS.MAX_RETRIES})...`);
         
         try {
-          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * retryCount));
+          await new Promise(resolve => setTimeout(resolve, CONSTANTS.RETRY_DELAY * retryCount));
           // 这里可以添加重连逻辑
         } catch (retryError) {
           console.error('重连失败:', retryError);
@@ -2027,7 +2103,7 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
     } finally {
       // 流结束后，更新统计信息
       if (hasUsageInfo && (totalPromptTokens > 0 || totalCompletionTokens > 0)) {
-        console.log(`流式请求统计更新: prompt=${totalPromptTokens}, completion=${totalCompletionTokens}`);
+        Logger.info(`流式请求统计更新: prompt=${totalPromptTokens}, completion=${totalCompletionTokens}`);
         updateRequestStats(totalPromptTokens, totalCompletionTokens);
       } else {
         // 如果没有获取到具体的使用统计，使用更智能的估算方法
@@ -2046,22 +2122,34 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
           estimatedCompletionTokens = Math.min(requestBody.max_tokens, Math.max(10, Math.ceil(requestBody.max_tokens * 0.7)));
         }
         
-        console.log(`流式请求估算统计: prompt=${estimatedPromptTokens}, completion=${estimatedCompletionTokens}`);
+        Logger.info(`流式请求估算统计: prompt=${estimatedPromptTokens}, completion=${estimatedCompletionTokens}`);
         updateRequestStats(estimatedPromptTokens, estimatedCompletionTokens);
       }
       
-      // 资源清理
+      // 资源清理 - 确保在合理的超时时间内完成
       try {
-        await writer.close();
-        console.log(`流式传输结束，客户端断开连接`);
+        await Promise.race([
+          writer.close(),
+          new Promise(resolve => setTimeout(resolve, 1000)) // 1秒超时
+        ]);
+        Logger.info(`流式传输结束，客户端断开连接`);
       } catch (closeError) {
-        console.warn('关闭流时出错:', closeError.message);
+        Logger.warn('关闭流时出错:', closeError.message);
       }
     }
   };
 
   // 启动流处理
   processStream();
+
+  // 确保流式传输完成后正确关闭
+  const cleanup = () => {
+    try {
+      writer.close();
+    } catch (error) {
+      Logger.warn('关闭流时出错:', error.message);
+    }
+  };
 
   // 返回优化的流式响应
   return new Response(readable, {
@@ -2075,7 +2163,7 @@ async function handleOptimizedStreaming(upstreamResponse, modelName, requestBody
       'Access-Control-Allow-Headers': 'Cache-Control, Content-Type, Authorization',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Transfer-Encoding': 'chunked',
-      'Keep-Alive': 'timeout=60, max=1000'
+      'Keep-Alive': 'timeout=30, max=100' // 缩短超时时间
     }
   });
 }
