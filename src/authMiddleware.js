@@ -1,10 +1,13 @@
 // 认证中间件 - 处理客户端token验证
 
-import { validateClientToken, updateTokenUsage } from './state.js';
+import { validateClientToken, updateTokenUsage, initializeState } from './state.js';
 import { ERROR_MESSAGES } from './config.js';
 
 // 客户端token验证中间件
 export async function validateClientTokenMiddleware(request, env) {
+  // 确保状态已初始化
+  await initializeState(env);
+
   // 获取Authorization头中的token
   const authHeader = request.headers.get('Authorization');
   
