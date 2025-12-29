@@ -63,7 +63,9 @@ export function shouldSkipAuth(pathname) {
     '/api/keys',
     '/api/client-tokens',
     '/favicon.ico',
-    '/static/'
+    '/favicon.svg',
+    '/static/',
+    '/.well-known/'
   ];
   
   // 使用精确匹配或前缀匹配（仅适用于特定路径）

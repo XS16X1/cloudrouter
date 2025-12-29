@@ -25,9 +25,33 @@ import {
 } from './loadBalancer.js';
 import { handleStreamResponse } from './streamHandler.js';
 import { withAuth } from './authMiddleware.js';
+import { FAVICON_ICO_BASE64, FAVICON_SVG } from './assets.js';
+import { checkAllKeysHealth, triggerBackgroundHealthCheck } from './healthCheck.js';
+import { getApiKeysWithStatus } from './state.js';
 
 // 创建路由器
 const router = Router();
+
+// --- 静态资源路由 ---
+router.get('/favicon.ico', () => {
+  // 优先使用 Base64 编码的 ICO，如果需要 SVG 可以修改
+  const buffer = Uint8Array.from(atob(FAVICON_ICO_BASE64), c => c.charCodeAt(0));
+  return new Response(buffer, {
+    headers: {
+      'Content-Type': 'image/x-icon',
+      'Cache-Control': 'public, max-age=86400'
+    }
+  });
+});
+
+router.get('/favicon.svg', () => {
+  return new Response(FAVICON_SVG, {
+    headers: {
+      'Content-Type': 'image/svg+xml',
+      'Cache-Control': 'public, max-age=86400'
+    }
+  });
+});
 
 // --- 认证辅助函数 ---
 
@@ -333,6 +357,41 @@ router.delete('/api/client-tokens/:token', async (request, env) => {
       headers: { 'Content-Type': 'application/json' }
     });
   }
+});
+
+// --- 密钥健康检查 API ---
+
+// 触发后台健康检查
+router.post('/api/health-check/trigger', async (request, env) => {
+  await initializeState(env);
+  
+  // 触发检查但不等待结果
+  triggerBackgroundHealthCheck(env);
+  
+  return new Response(JSON.stringify({ 
+    success: true, 
+    message: '健康检查已触发，请稍后刷新查看状态' 
+  }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+});
+
+// 获取健康检查结果
+router.get('/api/health-check/status', async (request, env) => {
+  await initializeState(env);
+  
+  const keys = getApiKeysWithStatus();
+  const healthyCount = keys.filter(k => k.status === 'active').length;
+  
+  return new Response(JSON.stringify({ 
+    success: true, 
+    total: keys.length,
+    healthy: healthyCount,
+    unhealthy: keys.length - healthyCount,
+    details: keys
+  }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 });
 
 // --- 管理API ---

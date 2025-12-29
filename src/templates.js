@@ -7,6 +7,8 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CloudRouter 管理面板</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <style>
         * { box-sizing: border-box; }
         body { 
@@ -34,10 +36,24 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
             border-radius: 4px; 
             font-size: 12px; 
             font-weight: 500; 
-            background: #d4edda; 
             color: #155724; 
+            /* 设置固定宽度和居中对齐，确保不换行 */
+            min-width: 60px;
+            text-align: center;
+            white-space: nowrap;
         }
-        .api-info { 
+        .status.active {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status.expired { 
+            background: #f8d7da; 
+            color: #721c24; 
+        }
+        .status.expiring-soon { 
+            background: #fff3cd; 
+            color: #856404; 
+        }        .api-info { 
             background: #e3f2fd; 
             border: 1px solid #bbdefb; 
             padding: 20px; 
@@ -207,12 +223,30 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
             margin-top: 5px; 
         }
         .token-list { margin-top: 20px; }
+        /* 优化 Token 列表布局 */
         .token-item { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
+            display: grid;
+            grid-template-columns: 1fr 1fr 80px 100px 60px 120px;
+            gap: 10px;
+            align-items: center;
             padding: 10px; 
             border-bottom: 1px solid #eee; 
+        }
+        /* 移动端适配 */
+        @media (max-width: 768px) {
+            .token-item {
+                grid-template-columns: 1fr;
+                gap: 5px;
+            }
+            .token-item > *:nth-child(1) { order: 1; font-weight: bold; } /* Token */
+            .token-item > *:nth-child(2) { order: 2; } /* Name */
+            .token-item > *:nth-child(3) { order: 3; display: inline-block; width: auto; } /* Status */
+            .token-item > *:nth-child(4) { order: 4; font-size: 12px; color: #666; } /* Expire */
+            .token-item > *:nth-child(5) { order: 5; font-size: 12px; } /* Usage */
+            .token-item > *:nth-child(6) { order: 6; margin-top: 5px; } /* Actions */
+            
+            /* 表头隐藏 */
+            .token-list thead { display: none; }
         }
         .token-item:last-child { border-bottom: none; }
         .token-value { 
@@ -220,7 +254,12 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
             background: #f8f9fa; 
             padding: 4px 8px; 
             border-radius: 4px; 
-            word-break: break-all; 
+            word-break: keep-all; 
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: inline-block;
+            max-width: 100%;
         }
         .expired { 
             background: #f8d7da; 
@@ -293,7 +332,10 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
         </div>
 
         <div class="key-list">
-            <h3>现有密钥 (<span id="keysCount">0</span>)</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>现有密钥 (<span id="keysCount">0</span>)</h3>
+                <button onclick="triggerHealthCheck()" class="submit-btn" style="background: #17a2b8; width: auto; padding: 6px 12px; font-size: 14px;">检查密钥健康</button>
+            </div>
             <div id="keysList">
                 <p>请刷新页面查看最新密钥列表</p>
             </div>
@@ -376,10 +418,18 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
                         html += '</tr></thead><tbody>';
                         
                         result.keys.forEach((key, index) => {
+                            const statusMap = {
+                                'active': '正常',
+                                'rate_limited': '限流',
+                                'expired': '过期',
+                                'invalid': '无效'
+                            };
+                            const statusText = statusMap[key.status] || key.status;
+                            
                             html += '<tr>';
                             html += '<td><input type="checkbox" class="key-checkbox" value="' + index + '" data-key="' + key.full_key + '"></td>';
                             html += '<td><span class="key-value">' + key.key + '</span></td>';
-                            html += '<td><span class="status">' + key.status + '</span></td>';
+                            html += '<td><span class="status ' + (key.status === 'active' ? 'active' : 'expired') + '">' + statusText + '</span></td>';
                             html += '<td>' + (key.daily_requests || 0) + '</td>';
                             html += '</tr>';
                         });
@@ -554,16 +604,20 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
                     if (result.tokens.length === 0) {
                         tokensList.innerHTML = '<p>暂无客户端token</p>';
                     } else {
-                        let html = '<table>';
-                        html += '<thead><tr>';
-                        html += '<th>Token</th>';
-                        html += '<th>客户端名称</th>';
-                        html += '<th>状态</th>';
-                        html += '<th>过期时间</th>';
-                        html += '<th>使用次数</th>';
-                        html += '<th>操作</th>';
-                        html += '</tr></thead><tbody>';
+                        // 使用 div 结构代替 table，以便更好地控制布局
+                        let html = '<div class="token-table">';
                         
+                        // 表头
+                        html += '<div class="token-item header" style="font-weight: bold; background: #f8f9fa;">';
+                        html += '<div>Token</div>';
+                        html += '<div>客户端名称</div>';
+                        html += '<div>状态</div>';
+                        html += '<div>过期时间</div>';
+                        html += '<div>次数</div>';
+                        html += '<div>操作</div>';
+                        html += '</div>';
+                        
+                        // 列表内容
                         result.tokens.forEach((token, index) => {
                             const now = new Date();
                             const expireDate = new Date(token.expireAt);
@@ -577,20 +631,20 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
                                 statusText = '已过期';
                             } else if (daysUntilExpire <= 7) {
                                 statusClass = 'expiring-soon';
-                                statusText = '即将过期(' + daysUntilExpire + '天)';
+                                statusText = '即将过期';
                             }
                             
-                            html += '<tr>';
-                            html += '<td><span class="token-value" title="' + token.token + '">' + token.token.substring(0, 20) + '...</span></td>';
-                            html += '<td>' + token.name + '</td>';
-                            html += '<td><span class="status ' + statusClass + '">' + statusText + '</span></td>';
-                            html += '<td>' + expireDate.toLocaleDateString() + '</td>';
-                            html += '<td>' + (token.requestCount || 0) + '</td>';
-                            html += '<td><button class="copy-btn" data-token="' + token.token + '">复制</button> <button class="delete-btn" data-token="' + token.token + '">删除</button></td>';
-                            html += '</tr>';
+                            html += '<div class="token-item">';
+                            html += '<div><span class="token-value" title="' + token.token + '">' + token.token.substring(0, 15) + '...</span></div>';
+                            html += '<div>' + token.name + '</div>';
+                            html += '<div><span class="status ' + statusClass + '">' + statusText + '</span></div>';
+                            html += '<div>' + expireDate.toLocaleDateString() + '</div>';
+                            html += '<div>' + (token.requestCount || 0) + '</div>';
+                            html += '<div><button class="copy-btn" data-token="' + token.token + '">复制</button> <button class="delete-btn" data-token="' + token.token + '">删除</button></div>';
+                            html += '</div>';
                         });
                         
-                        html += '</tbody></table>';
+                        html += '</div>';
                         tokensList.innerHTML = html;
                     }
                 }
@@ -737,6 +791,24 @@ export function getAdminPageHtml(originUrl, rpm, tpm, rpd, tpd) {
                 }
             } catch (error) {
                 alert('修改失败: ' + error.message);
+            }
+        }
+
+        // 触发健康检查
+        async function triggerHealthCheck() {
+            try {
+                const response = await fetch('/api/health-check/trigger', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert(result.message);
+                    // 延迟一点时间后重新加载列表
+                    setTimeout(loadKeys, 2000);
+                } else {
+                    alert('触发失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('触发失败: ' + error.message);
             }
         }
 

@@ -1,6 +1,11 @@
 // 统计模块 - 处理API请求统计和实时数据
 
 import { STORAGE_KEYS, ERROR_MESSAGES } from './config.js';
+import { 
+  getApiKeys,
+  getApiKeysWithStatus, // 新增
+  getKeyStatus // 新增
+} from './state.js';
 
 // 记录API请求统计
 export async function recordApiRequest(apiKey, env, promptTokens = 0, completionTokens = 0) {

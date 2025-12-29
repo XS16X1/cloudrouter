@@ -4,6 +4,7 @@ import { STORAGE_KEYS, ERROR_MESSAGES, CLIENT_TOKEN_CONFIG } from './config.js';
 
 // 核心全局变量
 let apiKeys = [];
+let apiKeyStatuses = {}; // 新增：存储密钥状态
 let clientTokens = []; // 新增：客户端token列表
 let currentKeyIndex = 0;
 let isInitialized = false;
@@ -45,6 +46,24 @@ export async function initializeState(env) {
     console.error('初始化状态失败:', error);
     apiKeys = [];
   }
+}
+
+// 更新密钥状态
+export function updateKeyStatus(key, status) {
+  apiKeyStatuses[key] = status;
+}
+
+// 获取密钥状态
+export function getKeyStatus(key) {
+  return apiKeyStatuses[key] || 'unknown'; // 默认为 active 或 unknown
+}
+
+// 获取API密钥列表（带状态）
+export function getApiKeysWithStatus() {
+  return apiKeys.map(key => ({
+    key: key,
+    status: apiKeyStatuses[key] || 'active' // 如果没有检查过，默认为 active
+  }));
 }
 
 // 获取API密钥列表
