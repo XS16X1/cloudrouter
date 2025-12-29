@@ -17,7 +17,8 @@ import {
 } from './state.js';
 import { 
   getRealTimeStats, 
-  getKeyUsageStats 
+  getKeyUsageStats,
+  recordApiRequest
 } from './stats.js';
 import { 
   getNextApiKey, 
@@ -228,14 +229,10 @@ router.post('/v1/chat/completions', withAuth(async (request, env) => {
         console.log(`API密钥 ${apiKey.substring(0, 8)}... 真实token使用量 - Prompt: ${promptTokens}, Completion: ${completionTokens}`);
         
         // 记录真实的API请求统计
-        // 注意：这里需要导入recordApiRequest，但是为了避免循环依赖，我们在stats.js中直接调用
-        // 这里使用import()动态导入
-        const { recordApiRequest } = await import('./stats.js');
         await recordApiRequest(apiKey, env, promptTokens, completionTokens);
       } catch (e) {
         console.error('解析响应token信息失败:', e);
         // 如果解析失败，使用估算值
-        const { recordApiRequest } = await import('./stats.js');
         await recordApiRequest(apiKey, env, 0, 0);
       }
       
